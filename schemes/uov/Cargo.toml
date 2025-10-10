@@ -1,0 +1,15 @@
+[package]
+name = "pqsigs-uov"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"         # SHAKE256
+criterion = { version = "0.5", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+bench = ["criterion"]

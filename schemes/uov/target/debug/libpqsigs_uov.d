@@ -1,0 +1,1 @@
+C:\Users\kearn\Desktop\Repos\pq-cryto\schemes\uov\target\debug\libpqsigs_uov.rlib: C:\Users\kearn\Desktop\Repos\pq-cryto\schemes\uov\src\keygen.rs C:\Users\kearn\Desktop\Repos\pq-cryto\schemes\uov\src\lib.rs C:\Users\kearn\Desktop\Repos\pq-cryto\schemes\uov\src\sign.rs C:\Users\kearn\Desktop\Repos\pq-cryto\schemes\uov\src\verify.rs
