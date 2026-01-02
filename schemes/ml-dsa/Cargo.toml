@@ -1,0 +1,20 @@
+[package]
+name = "pqsigs-ml-dsa"
+version = "0.1.0"
+edition = "2021"
+description = "ML-DSA (Module-Lattice Digital Signature Algorithm) post-quantum signature scheme - FIPS 204"
+license = "MIT"
+keywords = ["cryptography", "post-quantum", "signature", "ml-dsa", "dilithium"]
+categories = ["cryptography"]
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hex = "0.4"
+
+# [[bench]]
+# name = "ml_dsa_bench"
+# harness = false
