@@ -93,7 +93,7 @@ cargo test --release
 ## Test Coverage
 
 - **ML-DSA**: 126 tests covering all parameter sets, roundtrip verification, tampering detection, and edge cases
-- **UOV**: 20 tests plus 4 doc tests covering key generation, signing, and verification
+- **UOV**: 77 tests (27 unit + 46 integration + 4 doc tests) covering all parameter sets, field arithmetic, matrix operations, tampering detection, cross-key rejection, and stress tests
 
 ## Implementation Notes
 
