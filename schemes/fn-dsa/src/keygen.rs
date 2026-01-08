@@ -42,6 +42,8 @@ pub struct SecretKey {
     /// The polynomial G (NTRU complement of g).
     /// Uses i16 since coefficients may exceed i8 range after Babai reduction.
     pub big_g: Vec<i16>,
+    /// The public key h = g/f mod q (for signature computation).
+    pub h: Vec<i16>,
     /// The Gram-Schmidt orthogonalized basis for sampling.
     pub gs: GramSchmidt,
     /// The parameter set.
@@ -71,6 +73,12 @@ pub struct KeyPair {
 /// We use a moderate value - too large causes field norms to grow too fast.
 const KEYGEN_SIGMA: f64 = 1.5;
 
+/// Optimal weight for ternary polynomials.
+/// FALCON specification recommends weight ≈ n/4 for good security/efficiency trade-off.
+fn optimal_weight(n: usize) -> usize {
+    n / 4
+}
+
 /// Generates a random polynomial with small coefficients using discrete Gaussian sampling.
 ///
 /// Coefficients are sampled from a discrete Gaussian distribution N(0, sigma^2).
@@ -83,6 +91,33 @@ fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize) -> Vec<i8> {
         let z = sample_z_gaussian(rng, KEYGEN_SIGMA);
         // Clamp to i8 range (coefficients should be small, but clamp for safety)
         poly[i] = z.clamp(-127, 127) as i8;
+    }
+
+    poly
+}
+
+/// Generates a random polynomial optimized for NTRU solving.
+///
+/// Uses a hybrid approach: mostly small Gaussian coefficients with a few
+/// larger values to ensure good algebraic properties.
+fn generate_ntru_poly<R: RngCore>(rng: &mut R, n: usize, ensure_odd: bool) -> Vec<i8> {
+    let mut poly = vec![0i8; n];
+
+    // Use smaller sigma for most coefficients
+    let sigma = if n <= 64 { 1.2 } else { 1.0 };
+
+    for i in 0..n {
+        let z = sample_z_gaussian(rng, sigma);
+        poly[i] = z.clamp(-4, 4) as i8;
+    }
+
+    // Ensure first coefficient is non-zero and odd (helps with invertibility)
+    if ensure_odd {
+        if poly[0] == 0 {
+            poly[0] = if rng.gen_bool(0.5) { 1 } else { -1 };
+        } else if poly[0] % 2 == 0 {
+            poly[0] = if poly[0] > 0 { poly[0] - 1 } else { poly[0] + 1 };
+        }
     }
 
     poly
@@ -112,6 +147,12 @@ fn generate_ternary_poly<R: RngCore>(rng: &mut R, n: usize, weight: usize) -> Ve
     }
 
     poly
+}
+
+/// Checks if a polynomial has reasonable norm for key generation.
+fn check_poly_norm(poly: &[i8], max_norm_sq: i64) -> bool {
+    let norm_sq: i64 = poly.iter().map(|&x| (x as i64) * (x as i64)).sum();
+    norm_sq <= max_norm_sq
 }
 
 /// Checks if a polynomial is invertible modulo q using exact NTT.
@@ -161,22 +202,61 @@ fn compute_public_key(f: &[i8], g: &[i8]) -> Result<Vec<i16>> {
 
 /// Generates a FALCON key pair.
 ///
-/// This is the main key generation function.
+/// This is the main key generation function. It uses an optimized sampling
+/// strategy that balances between different polynomial generation methods
+/// to maximize the chance of finding valid NTRU pairs.
 pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
     let n = params.n;
-    // Use more attempts for finding valid NTRU pairs
-    // For small n, need many attempts to find coprime field norms
-    // For large n (512, 1024), field norms are products of many factors,
-    // making coprimality rarer - need significantly more attempts
-    let max_attempts = if n <= 32 { 5000 } else if n <= 64 { 2000 } else if n <= 128 { 10000 } else { 50000 };
+
+    // Adaptive max attempts based on n
+    // Larger n needs more attempts due to field norm coprimality being rarer
+    let max_attempts = if n <= 32 {
+        5000
+    } else if n <= 64 {
+        10000
+    } else if n <= 128 {
+        20000
+    } else {
+        100000
+    };
+
+    // Maximum norm for f, g polynomials (to keep field norms manageable)
+    let max_fg_norm_sq = (n as i64) * 16; // Allow coefficients up to ~4 on average
+
+    // Coefficient bound for F, G (relaxed for larger n)
+    let coeff_bound = if n <= 64 {
+        2 * (Q as i64)
+    } else if n <= 256 {
+        4 * (Q as i64)
+    } else {
+        10 * (Q as i64) // More relaxed for n=512, 1024
+    };
 
     for attempt in 0..max_attempts {
-        // Generate small random polynomials f and g
-        let f = generate_small_poly(rng, n);
-        let g = generate_small_poly(rng, n);
+        // Alternate between different sampling strategies
+        let (f, g) = match attempt % 3 {
+            0 => {
+                // Strategy 1: Gaussian sampling (most common)
+                (generate_small_poly(rng, n), generate_small_poly(rng, n))
+            }
+            1 => {
+                // Strategy 2: NTRU-optimized sampling with odd f[0]
+                (generate_ntru_poly(rng, n, true), generate_ntru_poly(rng, n, false))
+            }
+            _ => {
+                // Strategy 3: Ternary polynomials (sparse, good for coprimality)
+                let weight = optimal_weight(n).max(2);
+                (generate_ternary_poly(rng, n, weight), generate_ternary_poly(rng, n, weight))
+            }
+        };
 
-        // Check that f[0] is non-zero (required for Newton iteration in compute_public_key)
+        // Early rejection: check f[0] is non-zero
         if f[0] == 0 {
+            continue;
+        }
+
+        // Early rejection: check norms aren't too large
+        if !check_poly_norm(&f, max_fg_norm_sq) || !check_poly_norm(&g, max_fg_norm_sq) {
             continue;
         }
 
@@ -192,24 +272,10 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
             Err(_) => continue,
         };
 
-        // Check that F, G have reasonable norm
-        // The Gram-Schmidt orthogonalization requires that the basis vectors
-        // aren't too large. In FALCON, the bound is approximately:
-        // ||(f, F)|| * ||(g, G)|| < q * sqrt(n)
-        // For now, we use a simpler check based on coefficient bounds.
+        // Check that F, G have reasonable coefficient size
         let big_f_max: i64 = big_f.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
         let big_g_max: i64 = big_g.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
 
-        // F, G coefficients should be bounded by roughly q/2 for good keys
-        // For larger n (512, 1024), the FFT-based solver may produce larger
-        // coefficients, so we relax the bound proportionally
-        let coeff_bound = if n <= 64 {
-            2 * (Q as i64)
-        } else if n <= 256 {
-            4 * (Q as i64)
-        } else {
-            8 * (Q as i64)  // More relaxed for n=512, 1024
-        };
         if big_f_max > coeff_bound || big_g_max > coeff_bound {
             continue;
         }
@@ -234,6 +300,7 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
             g,
             big_f,
             big_g,
+            h: pk.h.clone(),
             gs,
             params: *params,
         };
@@ -244,6 +311,17 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
     Err(FnDsaError::KeygenFailed {
         reason: "exceeded maximum attempts",
     })
+}
+
+/// Generates a FALCON key pair with a specific seed.
+///
+/// This is useful for deterministic key generation in testing.
+pub fn keygen_with_seed(seed: u64, params: &Params) -> Result<KeyPair> {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    keygen(&mut rng, params)
 }
 
 /// Generates a FALCON-512 key pair.

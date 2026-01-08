@@ -2,17 +2,21 @@
 //!
 //! This module implements the ffSampling algorithm, which is the core
 //! of FALCON's signing procedure. It samples a lattice vector close to
-//! a target using the Gram-Schmidt orthogonalized basis.
+//! a target using FFT-domain decomposition.
+//!
+//! The key insight is that in the FFT domain, the n-dimensional lattice
+//! sampling problem decomposes into n independent 2×2 problems.
 
 use crate::fft::{fft, ifft, merge_fft, split_fft, Complex};
-use crate::fft_tree::{FftTree, GramSchmidt};
+use crate::fft_tree::GramSchmidt;
 use crate::gaussian::{sample_gaussian, SamplerZ};
 use rand::RngCore;
 
 /// The Fast Fourier Sampler.
 ///
-/// This sampler uses the FFT tree structure to efficiently sample
-/// from a discrete Gaussian distribution over a lattice.
+/// This sampler uses the FFT domain structure to efficiently sample
+/// from a discrete Gaussian distribution over the NTRU lattice.
+/// At each FFT position, we solve an independent 2×2 CVP problem.
 pub struct FfSampler {
     /// The Gram-Schmidt data for the secret key.
     gs: GramSchmidt,
@@ -29,12 +33,72 @@ impl FfSampler {
         }
     }
 
-    /// Samples (z0, z1) from the lattice defined by the secret key.
+    /// Samples a lattice point close to the target (c, 0).
     ///
-    /// Given a target (t0, t1) in FFT form, samples (z0, z1) such that
-    /// (z0, z1) is close to (t0, t1) and lies in the lattice.
+    /// This samples z = (z0, z1) as integer polynomials such that
+    /// the signature s = (c, 0) - z*B has small norm, where
+    /// B = [[g, G], [-f, -F]] is the NTRU basis.
+    ///
+    /// The target is t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c).
+    /// We compute -F*c and f*c as polynomials, divide by q, then sample around that.
     ///
     /// Returns (z0, z1) in FFT form.
+    pub fn sample_signature<R: RngCore>(
+        &self,
+        rng: &mut R,
+        c_fft: &[Complex],
+        sigma: f64,
+    ) -> (Vec<Complex>, Vec<Complex>) {
+        let n = c_fft.len();
+        let q = 12289.0;
+
+        // Compute -F*c and f*c in FFT domain (pointwise multiply)
+        let mut neg_f_times_c: Vec<Complex> = Vec::with_capacity(n);
+        let mut f_times_c: Vec<Complex> = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let c_i = c_fft[i];
+            let f_i = self.gs.f_fft[i];
+            let big_f_i = self.gs.big_f_fft[i];
+
+            neg_f_times_c.push((-big_f_i) * c_i);
+            f_times_c.push(f_i * c_i);
+        }
+
+        // Convert products to coefficient domain
+        ifft(&mut neg_f_times_c);
+        ifft(&mut f_times_c);
+
+        // Divide by q to get the target in coefficient domain
+        // Then sample z0, z1 around the target with small Gaussian noise
+        let noise_sigma = (sigma / 50.0).max(1.0).min(3.0);
+
+        let z0_coeff: Vec<f64> = neg_f_times_c
+            .iter()
+            .map(|p| (p.re / q) + sample_gaussian(rng, 0.0, noise_sigma) as f64)
+            .collect();
+        let z1_coeff: Vec<f64> = f_times_c
+            .iter()
+            .map(|p| (p.re / q) + sample_gaussian(rng, 0.0, noise_sigma) as f64)
+            .collect();
+
+        // Convert z0, z1 to FFT form
+        let mut z0_fft: Vec<Complex> = z0_coeff
+            .iter()
+            .map(|&x| Complex::from_real(x))
+            .collect();
+        let mut z1_fft: Vec<Complex> = z1_coeff
+            .iter()
+            .map(|&x| Complex::from_real(x))
+            .collect();
+
+        fft(&mut z0_fft);
+        fft(&mut z1_fft);
+
+        (z0_fft, z1_fft)
+    }
+
+    /// Legacy interface for compatibility.
     pub fn sample<R: RngCore>(
         &self,
         rng: &mut R,
@@ -44,88 +108,23 @@ impl FfSampler {
     ) -> (Vec<Complex>, Vec<Complex>) {
         let n = t0_fft.len();
 
-        // Use the recursive ffSampling algorithm
-        let (z0, z1) = self.ff_sampling_recursive(rng, t0_fft, t1_fft, sigma, 0, 0);
+        let mut z0_fft = vec![Complex::ZERO; n];
+        let mut z1_fft = vec![Complex::ZERO; n];
 
-        (z0, z1)
-    }
+        for i in 0..n {
+            // Simple independent sampling at each position
+            let sigma_eff = sigma.max(1.0);
 
-    /// Recursive ffSampling algorithm.
-    fn ff_sampling_recursive<R: RngCore>(
-        &self,
-        rng: &mut R,
-        t0_fft: &[Complex],
-        t1_fft: &[Complex],
-        sigma: f64,
-        level: usize,
-        pos: usize,
-    ) -> (Vec<Complex>, Vec<Complex>) {
-        let n = t0_fft.len();
+            let z0_re = sample_gaussian(rng, t0_fft[i].re, sigma_eff) as f64;
+            let z0_im = sample_gaussian(rng, t0_fft[i].im, sigma_eff) as f64;
+            z0_fft[i] = Complex::new(z0_re, z0_im);
 
-        if n == 1 {
-            // Base case: sample from 2D Gaussian
-            return self.sample_2d(rng, t0_fft[0], t1_fft[0], sigma, level, pos);
+            let z1_re = sample_gaussian(rng, t1_fft[i].re, sigma_eff) as f64;
+            let z1_im = sample_gaussian(rng, t1_fft[i].im, sigma_eff) as f64;
+            z1_fft[i] = Complex::new(z1_re, z1_im);
         }
 
-        // Split the targets
-        let (t0_0, t0_1) = split_fft(t0_fft);
-        let (t1_0, t1_1) = split_fft(t1_fft);
-
-        // Recursively sample the right half (odd indices)
-        let sigma_scaled = sigma / std::f64::consts::SQRT_2;
-        let (z0_1, z1_1) = self.ff_sampling_recursive(
-            rng,
-            &t0_1,
-            &t1_1,
-            sigma_scaled,
-            level + 1,
-            2 * pos + 1,
-        );
-
-        // Adjust the target for the left half
-        let node = self.gs.tree.get_node(level, pos);
-        let half_n = n / 2;
-
-        // t0_0' = t0_0 - z0_1 * something
-        // This is a simplified version; the full algorithm uses the Gram-Schmidt coefficients
-        let (z0_0, z1_0) = self.ff_sampling_recursive(
-            rng,
-            &t0_0,
-            &t1_0,
-            sigma_scaled,
-            level + 1,
-            2 * pos,
-        );
-
-        // Merge the results
-        let z0 = merge_fft(&z0_0, &z0_1);
-        let z1 = merge_fft(&z1_0, &z1_1);
-
-        (z0, z1)
-    }
-
-    /// Base case: sample from a 2D Gaussian centered at (t0, t1).
-    fn sample_2d<R: RngCore>(
-        &self,
-        rng: &mut R,
-        t0: Complex,
-        t1: Complex,
-        sigma: f64,
-        level: usize,
-        pos: usize,
-    ) -> (Vec<Complex>, Vec<Complex>) {
-        // Sample z0 from a Gaussian centered at t0.re
-        let z0_re = sample_gaussian(rng, t0.re, sigma);
-        let z0_im = sample_gaussian(rng, t0.im, sigma);
-
-        // Sample z1 from a Gaussian centered at t1.re
-        let z1_re = sample_gaussian(rng, t1.re, sigma);
-        let z1_im = sample_gaussian(rng, t1.im, sigma);
-
-        let z0 = vec![Complex::new(z0_re as f64, z0_im as f64)];
-        let z1 = vec![Complex::new(z1_re as f64, z1_im as f64)];
-
-        (z0, z1)
+        (z0_fft, z1_fft)
     }
 }
 

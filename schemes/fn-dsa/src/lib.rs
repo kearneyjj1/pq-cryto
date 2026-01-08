@@ -45,15 +45,24 @@ pub mod sampler;
 pub mod sign;
 pub mod verify;
 
-// Serialization will be implemented later:
-// pub mod packing;
+pub mod packing;
 
 // Re-export main types for convenience
 pub use error::{FnDsaError, Result};
-pub use keygen::{KeyPair, PublicKey, SecretKey, keygen, keygen_512, keygen_1024};
+pub use keygen::{KeyPair, PublicKey, SecretKey, keygen, keygen_512, keygen_1024, keygen_with_seed};
 pub use params::{Params, FALCON_512, FALCON_1024};
-pub use sign::{Signature, sign};
+pub use sign::{Signature, sign, sign_simple};
 pub use verify::verify;
+
+// Re-export packing functions
+pub use packing::{
+    encode_public_key, decode_public_key,
+    encode_secret_key, decode_secret_key,
+    encode_signature, decode_signature,
+    encode_signature_compressed,
+    encode_keypair, decode_keypair,
+    to_hex, from_hex,
+};
 
 #[cfg(test)]
 mod tests {

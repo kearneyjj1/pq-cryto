@@ -6,12 +6,10 @@
 use rand::RngCore;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
-use crate::fft_tree::GramSchmidt;
-use crate::field::Zq;
 use crate::hash::{generate_nonce, hash_to_point};
 use crate::keygen::SecretKey;
-use crate::params::{Params, Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE};
-use crate::sampler::{SimpleSampler, check_signature_norm};
+use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE};
+use crate::sampler::{FfSampler, SimpleSampler};
 
 /// A FALCON signature.
 #[derive(Clone, Debug)]
@@ -41,7 +39,7 @@ impl Signature {
 /// 1. Generates a random nonce
 /// 2. Hashes the message to a polynomial c
 /// 3. Computes the target t = (c, 0)
-/// 4. Samples a lattice vector (z0, z1) close to t
+/// 4. Samples a lattice vector (z0, z1) close to t using FFT sampling
 /// 5. Computes s2 = c - z0*f - z1*F
 /// 6. Checks if the norm is acceptable
 /// 7. Returns the signature (nonce, s2)
@@ -50,9 +48,21 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     let sigma = sk.params.sigma;
     let bound_sq = sk.params.sig_bound_sq;
 
-    let sampler = SimpleSampler::new();
+    // Create the FFT sampler using the Gram-Schmidt data from the secret key
+    let ff_sampler = FfSampler::new(sk.gs.clone());
 
-    for attempt in 0..MAX_SIGN_ATTEMPTS {
+    // Precompute FFT forms of the secret key polynomials
+    let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
+    let mut g_fft: Vec<Complex> = sk.g.iter().map(|&x| Complex::from_real(x as f64)).collect();
+    let mut big_f_fft: Vec<Complex> = sk.big_f.iter().map(|&x| Complex::from_real(x as f64)).collect();
+    let mut big_g_fft: Vec<Complex> = sk.big_g.iter().map(|&x| Complex::from_real(x as f64)).collect();
+
+    fft(&mut f_fft);
+    fft(&mut g_fft);
+    fft(&mut big_f_fft);
+    fft(&mut big_g_fft);
+
+    for _attempt in 0..MAX_SIGN_ATTEMPTS {
         // Generate a fresh nonce
         let nonce = generate_nonce(rng);
 
@@ -63,43 +73,13 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         let mut c_fft: Vec<Complex> = c.iter().map(|zq| Complex::from_real(zq.value() as f64)).collect();
         fft(&mut c_fft);
 
-        // The target is t = (c, 0) in the NTRU representation
-        // We sample (z0, z1) from the lattice close to t
+        // Use the FFT sampler to sample (z0, z1) close to the target
+        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft, sigma);
 
-        // Convert secret key to FFT form
-        let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
-        let mut g_fft: Vec<Complex> = sk.g.iter().map(|&x| Complex::from_real(x as f64)).collect();
-        let mut big_f_fft: Vec<Complex> = sk.big_f.iter().map(|&x| Complex::from_real(x as f64)).collect();
-        let mut big_g_fft: Vec<Complex> = sk.big_g.iter().map(|&x| Complex::from_real(x as f64)).collect();
-
-        fft(&mut f_fft);
-        fft(&mut g_fft);
-        fft(&mut big_f_fft);
-        fft(&mut big_g_fft);
-
-        // Compute the target in the lattice basis
-        // t0 = c * adj(g) / q (scaled)
-        // t1 = c * adj(f) / q (scaled)
-        // This is a simplified version
-
-        // Sample from the Gaussian centered at the target
-        let z0: Vec<i64> = (0..n)
-            .map(|_| sampler.sample(rng, 0.0, sigma))
-            .collect();
-        let z1: Vec<i64> = (0..n)
-            .map(|_| sampler.sample(rng, 0.0, sigma))
-            .collect();
-
-        // Convert z0, z1 to FFT form
-        let mut z0_fft: Vec<Complex> = z0.iter().map(|&x| Complex::from_real(x as f64)).collect();
-        let mut z1_fft: Vec<Complex> = z1.iter().map(|&x| Complex::from_real(x as f64)).collect();
-        fft(&mut z0_fft);
-        fft(&mut z1_fft);
-
-        // Compute s2 = c - z0*f - z1*F (in FFT form, then convert back)
+        // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
         for i in 0..n {
-            s2_fft.push(c_fft[i] - z0_fft[i] * f_fft[i] - z1_fft[i] * big_f_fft[i]);
+            s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
         }
 
         // Convert s2 back to coefficient form
@@ -117,24 +97,74 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
             })
             .collect();
 
-        // Also compute s1 for norm check
-        let mut s1_fft: Vec<Complex> = Vec::with_capacity(n);
-        for i in 0..n {
-            s1_fft.push(-z0_fft[i] * g_fft[i] - z1_fft[i] * big_g_fft[i]);
-        }
-        ifft(&mut s1_fft);
-        let s1: Vec<f64> = s1_fft.iter().map(|c| c.re).collect();
+        // Compute s1 = c - s2*h using polynomial arithmetic (same as verification)
+        // This ensures the norm check uses the same computation as verification
+        use crate::poly::Poly;
+        let c_poly = Poly::from_zq(c.clone());
+        let s2_poly = Poly::from_i16(&s2);
+        let h_poly = Poly::from_i16(&sk.h);
+        let s2h = s2_poly.mul(&h_poly);
+        let s1_poly = c_poly.sub(&s2h);
 
         // Check the norm
-        let s1_norm_sq: f64 = s1.iter().map(|&x| x * x).sum();
-        let s2_norm_sq: f64 = s2.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let s1_norm_sq = s1_poly.norm_sq();
+        let s2_norm_sq: i64 = s2.iter().map(|&x| (x as i64) * (x as i64)).sum();
         let total_norm_sq = s1_norm_sq + s2_norm_sq;
 
-        if total_norm_sq <= bound_sq {
+        if (total_norm_sq as f64) <= bound_sq {
             return Ok(Signature { nonce, s2 });
         }
+    }
 
-        // Retry if norm is too large
+    Err(FnDsaError::SigningFailed {
+        attempts: MAX_SIGN_ATTEMPTS,
+    })
+}
+
+/// Signs a message using direct s2 sampling with rejection (for educational demo).
+///
+/// This is NOT the proper FALCON algorithm - it directly samples s2 from a
+/// discrete Gaussian and uses rejection sampling to find a short (s1, s2) pair.
+/// This approach is much slower and doesn't provide the same security guarantees,
+/// but it demonstrates the verification correctness.
+pub fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
+    use crate::poly::Poly;
+
+    let n = sk.params.n;
+    let bound_sq = sk.params.sig_bound_sq;
+    let sampler = SimpleSampler::new();
+
+    // For direct sampling, we need a small sigma to keep norms manageable
+    // Expected ||s2||^2 ≈ n * sigma^2, and we need total norm < bound
+    // With bound_sq = 2e9, we can have ||s2||^2 + ||s1||^2 < 2e9
+    // If we sample s2 with sigma ~ 40, ||s2||^2 ~ 512 * 1600 = 820k
+    // Then s1 = c - s2*h needs ||s1||^2 < 2e9 - 820k ≈ 2e9
+    let sigma = 40.0;
+
+    for _attempt in 0..MAX_SIGN_ATTEMPTS {
+        let nonce = generate_nonce(rng);
+        let c = hash_to_point(message, &nonce, &sk.params);
+
+        // Directly sample s2 from a discrete Gaussian centered at 0
+        let s2: Vec<i16> = (0..n)
+            .map(|_| sampler.sample(rng, 0.0, sigma) as i16)
+            .collect();
+
+        // Compute s1 = c - s2*h using the same polynomial arithmetic as verification
+        let c_poly = Poly::from_zq(c.clone());
+        let s2_poly = Poly::from_i16(&s2);
+        let h_poly = Poly::from_i16(&sk.h);
+        let s2h = s2_poly.mul(&h_poly);
+        let s1_poly = c_poly.sub(&s2h);
+
+        // Check the norm
+        let s1_norm_sq = s1_poly.norm_sq();
+        let s2_norm_sq: i64 = s2.iter().map(|&x| (x as i64) * (x as i64)).sum();
+        let total_norm_sq = s1_norm_sq + s2_norm_sq;
+
+        if (total_norm_sq as f64) <= bound_sq {
+            return Ok(Signature { nonce, s2 });
+        }
     }
 
     Err(FnDsaError::SigningFailed {
@@ -183,10 +213,10 @@ pub fn sign_with_nonce<R: RngCore>(
     fft(&mut z0_fft);
     fft(&mut z1_fft);
 
-    // Compute s2 = c - z0*f - z1*F
+    // Compute s2 = z0*f + z1*F
     let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
     for i in 0..n {
-        s2_fft.push(c_fft[i] - z0_fft[i] * f_fft[i] - z1_fft[i] * big_f_fft[i]);
+        s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
     }
 
     ifft(&mut s2_fft);
