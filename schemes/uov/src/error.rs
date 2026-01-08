@@ -2,10 +2,37 @@
 
 use std::fmt;
 
+/// Specific reasons why signature verification failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationFailure {
+    /// The public map evaluation doesn't match the expected hash.
+    HashMismatch,
+    /// The signature point has wrong length.
+    InvalidLength,
+    /// The salt has wrong length.
+    InvalidSaltLength,
+    /// Generic verification failure (unspecified reason).
+    Generic,
+}
+
+impl fmt::Display for VerificationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VerificationFailure::HashMismatch => write!(f, "public map hash mismatch"),
+            VerificationFailure::InvalidLength => write!(f, "invalid signature length"),
+            VerificationFailure::InvalidSaltLength => write!(f, "invalid salt length"),
+            VerificationFailure::Generic => write!(f, "verification failed"),
+        }
+    }
+}
+
 /// Errors that can occur during UOV signature operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UovError {
-    /// Signature verification failed - the signature is invalid for the given message.
+    /// Signature verification failed with a specific reason.
+    VerificationFailed(VerificationFailure),
+
+    /// Signature verification failed (legacy variant for compatibility).
     InvalidSignature,
 
     /// Signing failed after exhausting all retry attempts.
@@ -38,6 +65,9 @@ pub enum UovError {
 impl fmt::Display for UovError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            UovError::VerificationFailed(reason) => {
+                write!(f, "signature verification failed: {}", reason)
+            }
             UovError::InvalidSignature => {
                 write!(f, "signature verification failed")
             }

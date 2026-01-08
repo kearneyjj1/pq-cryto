@@ -105,6 +105,18 @@ pub fn decode_public_key(bytes: &[u8]) -> Result<PublicKey> {
         h.push(coeff);
     }
 
+    // Validate h coefficients are in valid range [-(Q-1)/2, (Q-1)/2] (centered) or [0, Q) (positive)
+    // Public keys can use either representation, so accept both
+    let q = crate::params::Q as i16;
+    for &coeff in &h {
+        if coeff < -(q - 1) || coeff >= q {
+            return Err(FnDsaError::InvalidInput {
+                field: "public_key",
+                reason: "h coefficient out of range",
+            });
+        }
+    }
+
     Ok(PublicKey { h, params })
 }
 
@@ -394,6 +406,17 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
         s2.push(coeff);
     }
 
+    // Validate coefficient range: s2 should be in centered representation [-Q/2, Q/2]
+    let max_coeff = (crate::params::Q / 2) as i16;
+    for &coeff in &s2 {
+        if coeff < -max_coeff || coeff > max_coeff {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient out of range",
+            });
+        }
+    }
+
     Ok((Signature { nonce, s2 }, n))
 }
 
@@ -443,6 +466,17 @@ fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usi
         let abs_val = (encoded >> 1) as i16;
         let coeff = if sign == 1 { -abs_val } else { abs_val };
         s2.push(coeff);
+    }
+
+    // Validate coefficient range: s2 should be in centered representation [-Q/2, Q/2]
+    let max_coeff = (crate::params::Q / 2) as i16;
+    for &coeff in &s2 {
+        if coeff < -max_coeff || coeff > max_coeff {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient out of range",
+            });
+        }
     }
 
     Ok((Signature { nonce, s2 }, n))

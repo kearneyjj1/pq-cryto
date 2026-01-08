@@ -14,7 +14,14 @@ pub const N: usize = 256;
 /// Number of dropped bits from t (d = 13)
 pub const D: usize = 13;
 
-/// Root of unity for NTT (ζ = 1753)
+/// Root of unity for NTT (ζ = 1753).
+///
+/// ZETA is a primitive 512th root of unity modulo Q, meaning:
+/// - ZETA^512 ≡ 1 (mod Q)
+/// - ZETA^256 ≡ -1 (mod Q)
+/// - No smaller power of ZETA equals 1
+///
+/// This value is specified in FIPS 204 for the ML-DSA modulus Q = 8380417.
 pub const ZETA: i32 = 1753;
 
 /// Parameters for a specific ML-DSA security level.
@@ -202,5 +209,57 @@ mod tests {
         assert_eq!(ML_DSA_44.beta, (ML_DSA_44.tau * ML_DSA_44.eta) as i32);
         assert_eq!(ML_DSA_65.beta, (ML_DSA_65.tau * ML_DSA_65.eta) as i32);
         assert_eq!(ML_DSA_87.beta, (ML_DSA_87.tau * ML_DSA_87.eta) as i32);
+    }
+
+    /// Helper to compute a^e mod m.
+    fn powmod(base: i32, mut exp: u32, modulus: i64) -> i64 {
+        let mut result = 1i64;
+        let mut b = base as i64 % modulus;
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = (result * b) % modulus;
+            }
+            b = (b * b) % modulus;
+            exp >>= 1;
+        }
+        result
+    }
+
+    #[test]
+    fn test_zeta_is_primitive_512th_root() {
+        // ZETA^512 ≡ 1 (mod Q)
+        let zeta_512 = powmod(ZETA, 512, Q as i64);
+        assert_eq!(zeta_512, 1, "ZETA^512 should equal 1 mod Q");
+
+        // ZETA^256 ≡ -1 (mod Q)
+        let zeta_256 = powmod(ZETA, 256, Q as i64);
+        assert_eq!(zeta_256, (Q - 1) as i64, "ZETA^256 should equal -1 mod Q");
+
+        // Verify ZETA is primitive: ZETA^k ≠ 1 for k < 512
+        // Check divisors of 512: 1, 2, 4, 8, 16, 32, 64, 128, 256
+        for &k in &[1u32, 2, 4, 8, 16, 32, 64, 128, 256] {
+            let zeta_k = powmod(ZETA, k, Q as i64);
+            assert_ne!(zeta_k, 1, "ZETA^{} should not equal 1 mod Q", k);
+        }
+    }
+
+    #[test]
+    fn test_n_inverse_mod_q() {
+        // The inverse of N=256 mod Q should be 8347681
+        // Verify: 256 * 8347681 ≡ 1 (mod Q)
+        let n_inv: i64 = 8347681;
+        let product = (N as i64 * n_inv) % (Q as i64);
+        assert_eq!(product, 1, "256 * 8347681 should equal 1 mod Q");
+    }
+
+    #[test]
+    fn test_q_ntt_friendly() {
+        // Q should support 512th roots of unity
+        // This requires Q - 1 to be divisible by 512
+        assert_eq!((Q - 1) % 512, 0, "Q-1 should be divisible by 512 for NTT");
+
+        // Q - 1 = 8380416 = 2^13 * 1023 = 2^13 * 3 * 11 * 31
+        // So Q supports up to 2^13 = 8192 th roots of unity
+        assert_eq!((Q - 1) % (1 << 13), 0, "Q-1 should be divisible by 2^13");
     }
 }

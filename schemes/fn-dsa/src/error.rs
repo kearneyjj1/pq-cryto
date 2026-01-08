@@ -2,10 +2,37 @@
 
 use std::fmt;
 
+/// Specific reasons why signature verification failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationFailure {
+    /// The signature norm exceeds the allowed bound.
+    NormBoundExceeded,
+    /// The recovered hash doesn't match expected value.
+    HashMismatch,
+    /// The signature polynomial has invalid coefficients.
+    InvalidCoefficients,
+    /// Generic verification failure (unspecified reason).
+    Generic,
+}
+
+impl fmt::Display for VerificationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VerificationFailure::NormBoundExceeded => write!(f, "signature norm exceeded"),
+            VerificationFailure::HashMismatch => write!(f, "hash mismatch"),
+            VerificationFailure::InvalidCoefficients => write!(f, "invalid coefficients"),
+            VerificationFailure::Generic => write!(f, "verification failed"),
+        }
+    }
+}
+
 /// Errors that can occur during FN-DSA operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FnDsaError {
-    /// The signature failed verification.
+    /// Signature verification failed with a specific reason.
+    VerificationFailed(VerificationFailure),
+
+    /// The signature failed verification (legacy variant).
     InvalidSignature,
 
     /// Signing failed after the specified number of attempts.
@@ -56,6 +83,9 @@ pub enum FnDsaError {
 impl fmt::Display for FnDsaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FnDsaError::VerificationFailed(reason) => {
+                write!(f, "signature verification failed: {}", reason)
+            }
             FnDsaError::InvalidSignature => write!(f, "invalid signature"),
             FnDsaError::SigningFailed { attempts } => {
                 write!(f, "signing failed after {} attempts", attempts)

@@ -39,6 +39,8 @@ pub fn pack_t1(poly: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks t1 polynomial (10 bits per coefficient).
+///
+/// Validates that all coefficients are in the valid range [0, 2^10).
 pub fn unpack_t1(bytes: &[u8]) -> Result<Poly> {
     if bytes.len() != N * 10 / 8 {
         return Err(MlDsaError::DecodingError { context: "t1" });
@@ -55,6 +57,14 @@ pub fn unpack_t1(bytes: &[u8]) -> Result<Poly> {
             ((bytes[5 * i + 2] >> 4) as i32) | (((bytes[5 * i + 3] & 0x3F) as i32) << 4);
         poly.coeffs[4 * i + 3] =
             ((bytes[5 * i + 3] >> 6) as i32) | ((bytes[5 * i + 4] as i32) << 2);
+    }
+
+    // Validate coefficient range: t1 must be in [0, 2^10)
+    let max_t1 = 1 << 10;
+    for coeff in &poly.coeffs {
+        if *coeff < 0 || *coeff >= max_t1 {
+            return Err(MlDsaError::DecodingError { context: "t1 coefficient out of range" });
+        }
     }
 
     Ok(poly)
@@ -94,6 +104,8 @@ pub fn pack_t0(poly: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks t0 polynomial (13 bits per coefficient).
+///
+/// Validates that all coefficients are in the valid range [-(2^(D-1)-1), 2^(D-1)].
 pub fn unpack_t0(bytes: &[u8]) -> Result<Poly> {
     if bytes.len() != N * D / 8 {
         return Err(MlDsaError::DecodingError { context: "t0" });
@@ -122,6 +134,15 @@ pub fn unpack_t0(bytes: &[u8]) -> Result<Poly> {
         poly.coeffs[8 * i + 5] = (center as i32) - (c5 as i32);
         poly.coeffs[8 * i + 6] = (center as i32) - (c6 as i32);
         poly.coeffs[8 * i + 7] = (center as i32) - (c7 as i32);
+    }
+
+    // Validate coefficient range: t0 must be in [-(2^(D-1)-1), 2^(D-1)]
+    let min_t0 = -(center as i32) + 1;
+    let max_t0 = center as i32;
+    for coeff in &poly.coeffs {
+        if *coeff < min_t0 || *coeff > max_t0 {
+            return Err(MlDsaError::DecodingError { context: "t0 coefficient out of range" });
+        }
     }
 
     Ok(poly)
@@ -158,6 +179,8 @@ fn pack_eta2(poly: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks polynomial with η=2.
+///
+/// Validates that all coefficients are in the valid range [-2, 2].
 pub fn unpack_eta2(bytes: &[u8]) -> Result<Poly> {
     if bytes.len() != N * 3 / 8 {
         return Err(MlDsaError::DecodingError { context: "eta2" });
@@ -176,6 +199,11 @@ pub fn unpack_eta2(bytes: &[u8]) -> Result<Poly> {
         let t5 = ((b[1] >> 7) | (b[2] << 1)) & 0x07;
         let t6 = (b[2] >> 2) & 0x07;
         let t7 = b[2] >> 5;
+
+        // Validate raw values are in [0, 4] before conversion
+        if t0 > 4 || t1 > 4 || t2 > 4 || t3 > 4 || t4 > 4 || t5 > 4 || t6 > 4 || t7 > 4 {
+            return Err(MlDsaError::DecodingError { context: "eta2 coefficient out of range" });
+        }
 
         poly.coeffs[8 * i] = 2 - t0 as i32;
         poly.coeffs[8 * i + 1] = 2 - t1 as i32;
@@ -205,6 +233,8 @@ fn pack_eta4(poly: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks polynomial with η=4.
+///
+/// Validates that all coefficients are in the valid range [-4, 4].
 pub fn unpack_eta4(bytes: &[u8]) -> Result<Poly> {
     if bytes.len() != N / 2 {
         return Err(MlDsaError::DecodingError { context: "eta4" });
@@ -213,8 +243,16 @@ pub fn unpack_eta4(bytes: &[u8]) -> Result<Poly> {
     let mut poly = Poly::zero();
 
     for i in 0..N / 2 {
-        poly.coeffs[2 * i] = 4 - (bytes[i] & 0x0F) as i32;
-        poly.coeffs[2 * i + 1] = 4 - (bytes[i] >> 4) as i32;
+        let t0 = bytes[i] & 0x0F;
+        let t1 = bytes[i] >> 4;
+
+        // Validate raw values are in [0, 8] before conversion
+        if t0 > 8 || t1 > 8 {
+            return Err(MlDsaError::DecodingError { context: "eta4 coefficient out of range" });
+        }
+
+        poly.coeffs[2 * i] = 4 - t0 as i32;
+        poly.coeffs[2 * i + 1] = 4 - t1 as i32;
     }
 
     Ok(poly)
@@ -302,6 +340,7 @@ fn unpack_z_17(bytes: &[u8]) -> Result<Poly> {
     }
 
     let gamma1 = 1 << 17;
+    let max_encoded = (2 * gamma1 - 1) as u32; // 2γ1 - 1
     let mut poly = Poly::zero();
 
     for i in 0..N / 4 {
@@ -311,6 +350,11 @@ fn unpack_z_17(bytes: &[u8]) -> Result<Poly> {
         let c1 = ((b[2] >> 2) as u32) | ((b[3] as u32) << 6) | (((b[4] & 0x0F) as u32) << 14);
         let c2 = ((b[4] >> 4) as u32) | ((b[5] as u32) << 4) | (((b[6] & 0x3F) as u32) << 12);
         let c3 = ((b[6] >> 6) as u32) | ((b[7] as u32) << 2) | ((b[8] as u32) << 10);
+
+        // Validate encoded values are in [0, 2γ1 - 1]
+        if c0 > max_encoded || c1 > max_encoded || c2 > max_encoded || c3 > max_encoded {
+            return Err(MlDsaError::DecodingError { context: "z coefficient out of range" });
+        }
 
         poly.coeffs[4 * i] = gamma1 - c0 as i32;
         poly.coeffs[4 * i + 1] = gamma1 - c1 as i32;
@@ -327,6 +371,7 @@ fn unpack_z_19(bytes: &[u8]) -> Result<Poly> {
     }
 
     let gamma1 = 1 << 19;
+    let max_encoded = (2 * gamma1 - 1) as u32; // 2γ1 - 1
     let mut poly = Poly::zero();
 
     for i in 0..N / 4 {
@@ -336,6 +381,11 @@ fn unpack_z_19(bytes: &[u8]) -> Result<Poly> {
         let c1 = ((b[2] >> 4) as u32) | ((b[3] as u32) << 4) | ((b[4] as u32) << 12);
         let c2 = (b[5] as u32) | ((b[6] as u32) << 8) | (((b[7] & 0x0F) as u32) << 16);
         let c3 = ((b[7] >> 4) as u32) | ((b[8] as u32) << 4) | ((b[9] as u32) << 12);
+
+        // Validate encoded values are in [0, 2γ1 - 1]
+        if c0 > max_encoded || c1 > max_encoded || c2 > max_encoded || c3 > max_encoded {
+            return Err(MlDsaError::DecodingError { context: "z coefficient out of range" });
+        }
 
         poly.coeffs[4 * i] = gamma1 - c0 as i32;
         poly.coeffs[4 * i + 1] = gamma1 - c1 as i32;
