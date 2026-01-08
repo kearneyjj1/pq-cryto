@@ -15,6 +15,7 @@ use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake256,
 };
+// Note: We manually zeroize F elements since F doesn't implement Zeroize
 
 use crate::field::F;
 use crate::matrix::{idx_ut, sample_invertible};
@@ -74,6 +75,10 @@ impl PublicKey {
 ///
 /// Contains the parameter set, the invertible transformation matrix T,
 /// and the central OV quadratic forms.
+///
+/// # Security
+///
+/// This struct implements `Drop` to zeroize secret key material when dropped.
 pub struct SecretKey {
     /// The parameter set used for this key.
     pub params: Params,
@@ -81,6 +86,25 @@ pub struct SecretKey {
     pub t: Vec<Vec<F>>,
     /// The central OV quadratic forms (m forms, each in UT packed format).
     pub f_quads: Vec<Vec<F>>,
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        // Zeroize the transformation matrix T
+        // We manually zero each element since F doesn't implement Zeroize
+        for row in &mut self.t {
+            for elem in row.iter_mut() {
+                *elem = F::ZERO;
+            }
+        }
+
+        // Zeroize the central quadratic forms
+        for form in &mut self.f_quads {
+            for elem in form.iter_mut() {
+                *elem = F::ZERO;
+            }
+        }
+    }
 }
 
 impl SecretKey {

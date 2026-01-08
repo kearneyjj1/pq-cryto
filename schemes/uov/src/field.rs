@@ -104,6 +104,11 @@ impl SubAssign for F {
 }
 
 /// Multiplication in GF(2^8) using the AES polynomial for reduction.
+///
+/// # Security
+///
+/// This implementation is constant-time: it always performs exactly 8 iterations
+/// with the same operations, using masking instead of data-dependent branches.
 impl Mul for F {
     type Output = F;
 
@@ -113,15 +118,16 @@ impl Mul for F {
         let mut a = self.0;
         let mut b = rhs.0;
 
-        while b != 0 {
-            if (b & 1) != 0 {
-                result ^= a;
-            }
-            let high_bit = (a & 0x80) != 0;
-            a <<= 1;
-            if high_bit {
-                a ^= 0x1b; // Reduce by x^8 + x^4 + x^3 + x + 1
-            }
+        // Fixed 8 iterations for constant-time execution
+        for _ in 0..8 {
+            // Mask is 0xFF if (b & 1) == 1, else 0x00
+            let mask = 0u8.wrapping_sub(b & 1);
+            result ^= a & mask;
+
+            // Mask for high bit reduction
+            let high_bit_mask = 0u8.wrapping_sub((a >> 7) & 1);
+            a = (a << 1) ^ (0x1b & high_bit_mask);
+
             b >>= 1;
         }
 

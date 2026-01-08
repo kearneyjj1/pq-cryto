@@ -4,9 +4,12 @@
 //! signing algorithm. The sampler produces integers from a discrete Gaussian
 //! distribution centered at a given mean with a given standard deviation.
 //!
-//! FALCON uses floating-point arithmetic for the Gaussian sampler, which
-//! introduces potential timing side-channels. This implementation prioritizes
-//! correctness over constant-time guarantees.
+//! # Security Notes
+//!
+//! This implementation uses CDT-based sampling with constant-time table lookups
+//! for the base sampler. However, some operations (especially for large sigma)
+//! may still have timing variations. For maximum security, hardware-specific
+//! constant-time implementations should be used.
 
 use rand::{Rng, RngCore};
 use std::f64::consts::{E, PI};
@@ -206,24 +209,36 @@ impl BaseSampler {
     }
 
     /// Samples from the base discrete Gaussian.
+    ///
+    /// # Security
+    ///
+    /// This uses a constant-time linear scan through the CDT table,
+    /// avoiding data-dependent branches that could leak information.
+    /// All comparisons use arithmetic masking instead of conditional branches.
     pub fn sample<R: RngCore>(&self, rng: &mut R) -> i64 {
         // Sample from the half-Gaussian using CDT
         let u: u64 = rng.gen();
         let half_u = u >> 1; // Use top 63 bits
 
-        // Binary search in CDT
-        let abs_z = match self.cdt.binary_search(&half_u) {
-            Ok(i) => i as i64,
-            Err(i) => i as i64,
-        };
-
-        // Sample sign (unless z=0)
-        if abs_z == 0 {
-            0
-        } else {
-            let sign: i64 = if (u & 1) == 0 { 1 } else { -1 };
-            sign * abs_z
+        // Constant-time linear scan through CDT
+        // Count how many thresholds half_u exceeds
+        let mut abs_z: i64 = 0;
+        for &threshold in &self.cdt {
+            // Constant-time comparison: (half_u >= threshold) without branching
+            // If half_u >= threshold, then (half_u.wrapping_sub(threshold)) has high bit 0
+            // If half_u < threshold, then wrapping_sub produces a large number with high bit 1
+            let diff = half_u.wrapping_sub(threshold);
+            let exceeded = ((!(diff >> 63)) & 1) as i64; // 1 if half_u >= threshold, 0 otherwise
+            abs_z += exceeded;
         }
+
+        // Sample sign using the LSB of u (constant-time)
+        let sign_bit = (u & 1) as i64;
+        let sign = 1 - 2 * sign_bit; // 1 if bit=0, -1 if bit=1
+
+        // Apply sign, but return 0 if abs_z == 0
+        // Use constant-time selection: result = sign * abs_z (which is 0 when abs_z is 0)
+        sign * abs_z
     }
 }
 

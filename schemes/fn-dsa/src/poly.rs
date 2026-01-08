@@ -83,6 +83,8 @@ impl Poly {
     }
 
     /// Computes the squared L2 norm using centered representation.
+    ///
+    /// Uses saturating arithmetic to prevent overflow for very large polynomials.
     pub fn norm_sq(&self) -> i64 {
         self.coeffs
             .iter()
@@ -90,7 +92,7 @@ impl Poly {
                 let v = c.centered() as i64;
                 v * v
             })
-            .sum()
+            .fold(0i64, |acc, x| acc.saturating_add(x))
     }
 
     /// Computes the L2 norm.
@@ -177,9 +179,17 @@ impl Poly {
         // Convert back
         ifft(&mut c_fft);
 
-        // Round and reduce
+        // Round and reduce with overflow protection
         Poly {
-            coeffs: c_fft.iter().map(|c| Zq::new(c.re.round() as i32)).collect(),
+            coeffs: c_fft
+                .iter()
+                .map(|c| {
+                    let rounded = c.re.round();
+                    // Clamp to i32 range to prevent overflow on cast
+                    let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                    Zq::new(clamped)
+                })
+                .collect(),
         }
     }
 }
@@ -233,11 +243,23 @@ impl PolyFft {
     }
 
     /// Converts back to a polynomial (rounds coefficients).
+    ///
+    /// # Safety
+    ///
+    /// Uses clamping to prevent integer overflow when converting from f64 to i32.
     pub fn to_poly(&self) -> Poly {
         let mut coeffs = self.coeffs.clone();
         ifft(&mut coeffs);
         Poly {
-            coeffs: coeffs.iter().map(|c| Zq::new(c.re.round() as i32)).collect(),
+            coeffs: coeffs
+                .iter()
+                .map(|c| {
+                    let rounded = c.re.round();
+                    // Clamp to i32 range to prevent overflow on cast
+                    let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                    Zq::new(clamped)
+                })
+                .collect(),
         }
     }
 

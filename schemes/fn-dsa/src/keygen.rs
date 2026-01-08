@@ -4,6 +4,7 @@
 //! which produces a public/secret key pair from random input.
 
 use rand::{Rng, RngCore};
+use zeroize::Zeroize;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, Complex};
 use crate::fft_tree::GramSchmidt;
@@ -30,6 +31,10 @@ impl PublicKey {
 }
 
 /// A FALCON secret key.
+///
+/// # Security
+///
+/// This struct implements `Drop` to zeroize secret key material when dropped.
 #[derive(Clone)]
 pub struct SecretKey {
     /// The polynomial f (small coefficients).
@@ -48,6 +53,23 @@ pub struct SecretKey {
     pub gs: GramSchmidt,
     /// The parameter set.
     pub params: Params,
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        // Zeroize all secret polynomials
+        self.f.zeroize();
+        self.g.zeroize();
+        self.big_f.zeroize();
+        self.big_g.zeroize();
+        // Note: h is public, but we zeroize it anyway
+        self.h.zeroize();
+        // Zeroize Gram-Schmidt data (contains FFT of secret polynomials)
+        self.gs.f_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
+        self.gs.g_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
+        self.gs.big_f_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
+        self.gs.big_g_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
+    }
 }
 
 impl SecretKey {

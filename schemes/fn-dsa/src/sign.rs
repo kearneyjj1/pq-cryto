@@ -28,8 +28,12 @@ impl Signature {
     }
 
     /// Returns the squared norm of the signature.
+    ///
+    /// Uses saturating arithmetic to prevent overflow.
     pub fn norm_sq(&self) -> i64 {
-        self.s2.iter().map(|&x| (x as i64) * (x as i64)).sum()
+        self.s2.iter()
+            .map(|&x| (x as i64) * (x as i64))
+            .fold(0i64, |acc, x| acc.saturating_add(x))
     }
 }
 
@@ -106,10 +110,12 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         let s2h = s2_poly.mul(&h_poly);
         let s1_poly = c_poly.sub(&s2h);
 
-        // Check the norm
+        // Check the norm (using saturating arithmetic for safety)
         let s1_norm_sq = s1_poly.norm_sq();
-        let s2_norm_sq: i64 = s2.iter().map(|&x| (x as i64) * (x as i64)).sum();
-        let total_norm_sq = s1_norm_sq + s2_norm_sq;
+        let s2_norm_sq: i64 = s2.iter()
+            .map(|&x| (x as i64) * (x as i64))
+            .fold(0i64, |acc, x| acc.saturating_add(x));
+        let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
 
         if (total_norm_sq as f64) <= bound_sq {
             return Ok(Signature { nonce, s2 });
@@ -157,10 +163,12 @@ pub fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> R
         let s2h = s2_poly.mul(&h_poly);
         let s1_poly = c_poly.sub(&s2h);
 
-        // Check the norm
+        // Check the norm (using saturating arithmetic for safety)
         let s1_norm_sq = s1_poly.norm_sq();
-        let s2_norm_sq: i64 = s2.iter().map(|&x| (x as i64) * (x as i64)).sum();
-        let total_norm_sq = s1_norm_sq + s2_norm_sq;
+        let s2_norm_sq: i64 = s2.iter()
+            .map(|&x| (x as i64) * (x as i64))
+            .fold(0i64, |acc, x| acc.saturating_add(x));
+        let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
 
         if (total_norm_sq as f64) <= bound_sq {
             return Ok(Signature { nonce, s2 });

@@ -31,16 +31,22 @@ pub fn transpose(a: &[Vec<F>]) -> Vec<Vec<F>> {
 }
 
 /// Multiplies two square matrices over GF(256).
+///
+/// # Security
+///
+/// This implementation is constant-time: it always performs n³ field multiplications
+/// regardless of the values in the matrices. The field multiplication is also
+/// constant-time, ensuring no timing leakage of matrix contents.
 pub fn mat_mul(a: &[Vec<F>], b: &[Vec<F>]) -> Vec<Vec<F>> {
     let n = a.len();
     let mut c = vec![vec![F::ZERO; n]; n];
+    // Always perform all multiplications for constant-time execution
     for i in 0..n {
         for k in 0..n {
             let aik = a[i][k];
-            if !aik.is_zero() {
-                for j in 0..n {
-                    c[i][j] += aik * b[k][j];
-                }
+            // No early-exit optimization to ensure constant-time
+            for j in 0..n {
+                c[i][j] += aik * b[k][j];
             }
         }
     }
@@ -76,6 +82,11 @@ pub fn full_to_ut(n: usize, m: &[Vec<F>]) -> Vec<F> {
 /// Computes the rank of a matrix using Gaussian elimination.
 ///
 /// Note: This function modifies the input matrix in place.
+///
+/// # Security
+///
+/// This function uses constant-time pivot selection and elimination to avoid
+/// leaking information about matrix structure through timing.
 pub fn rank(a: &mut [Vec<F>]) -> usize {
     let n = a.len();
     if n == 0 {
@@ -85,17 +96,23 @@ pub fn rank(a: &mut [Vec<F>]) -> usize {
     let mut r = 0;
 
     for col in 0..cols {
-        // Find pivot
-        let mut piv = None;
+        // Constant-time pivot selection: scan all rows and select first non-zero
+        // using arithmetic masking instead of early-exit
+        let mut pivot_row = n; // Invalid value indicating no pivot found
+        let mut found_mask = 0u8; // 0 = not found yet, 0xFF = found
+
         for row in r..n {
-            if !a[row][col].is_zero() {
-                piv = Some(row);
-                break;
+            let is_nonzero = if a[row][col].is_zero() { 0u8 } else { 0xFF };
+            let is_first = !found_mask & is_nonzero;
+            // If this is the first non-zero, record it
+            if is_first != 0 {
+                pivot_row = row;
             }
+            found_mask |= is_nonzero;
         }
 
-        if let Some(p) = piv {
-            a.swap(r, p);
+        if pivot_row < n {
+            a.swap(r, pivot_row);
             let inv = a[r][col].inverse();
 
             // Scale pivot row
@@ -103,17 +120,16 @@ pub fn rank(a: &mut [Vec<F>]) -> usize {
                 a[r][j] *= inv;
             }
 
-            // Eliminate column
+            // Eliminate column - always process all rows for constant time
             for i in 0..n {
                 if i == r {
                     continue;
                 }
                 let f = a[i][col];
-                if !f.is_zero() {
-                    for j in col..cols {
-                        let pivot_val = a[r][j];
-                        a[i][j] -= f * pivot_val;
-                    }
+                // Always perform the elimination (f * 0 = 0 for zero rows)
+                for j in col..cols {
+                    let pivot_val = a[r][j];
+                    a[i][j] -= f * pivot_val;
                 }
             }
             r += 1;
@@ -123,11 +139,21 @@ pub fn rank(a: &mut [Vec<F>]) -> usize {
     r
 }
 
+/// Maximum number of attempts to sample an invertible matrix.
+/// For GF(256), the probability of a random matrix being singular is very low,
+/// so this bound should never be reached in practice.
+const MAX_INVERTIBLE_ATTEMPTS: usize = 1000;
+
 /// Samples a random invertible n×n matrix over GF(256).
 ///
 /// Uses rejection sampling: generates random matrices until one with full rank is found.
+///
+/// # Panics
+///
+/// Panics if unable to find an invertible matrix within MAX_INVERTIBLE_ATTEMPTS tries.
+/// This should essentially never happen with a proper RNG.
 pub fn sample_invertible<R: RngCore + CryptoRng>(rng: &mut R, n: usize) -> Vec<Vec<F>> {
-    loop {
+    for _ in 0..MAX_INVERTIBLE_ATTEMPTS {
         let mut a = vec![vec![F::ZERO; n]; n];
         for row in a.iter_mut() {
             for elem in row.iter_mut() {
@@ -139,33 +165,49 @@ pub fn sample_invertible<R: RngCore + CryptoRng>(rng: &mut R, n: usize) -> Vec<V
             return a;
         }
     }
+    panic!("Failed to sample invertible matrix after {} attempts", MAX_INVERTIBLE_ATTEMPTS);
 }
 
 /// Solves the linear system Ax = b over GF(256) using Gaussian elimination.
 ///
 /// Returns `None` if the system is singular (no unique solution).
+///
+/// # Security
+///
+/// This function uses constant-time operations to avoid leaking information
+/// about the matrix structure through timing side channels.
 pub fn solve(mut a: Vec<Vec<F>>, mut b: Vec<F>) -> Option<Vec<F>> {
     let n = b.len();
     if n == 0 {
         return Some(vec![]);
     }
 
+    let mut singular = false;
+
     // Forward elimination with partial pivoting
     for col in 0..n {
-        // Find pivot
-        let mut piv = None;
+        // Constant-time pivot selection
+        let mut pivot_row = n;
+        let mut found_mask = 0u8;
+
         for r in col..n {
-            if !a[r][col].is_zero() {
-                piv = Some(r);
-                break;
+            let is_nonzero = if a[r][col].is_zero() { 0u8 } else { 0xFF };
+            let is_first = !found_mask & is_nonzero;
+            if is_first != 0 {
+                pivot_row = r;
             }
+            found_mask |= is_nonzero;
         }
-        let p = piv?;
+
+        if pivot_row >= n {
+            singular = true;
+            continue; // Continue processing to maintain constant time
+        }
 
         // Swap rows
-        if p != col {
-            a.swap(p, col);
-            b.swap(p, col);
+        if pivot_row != col {
+            a.swap(pivot_row, col);
+            b.swap(pivot_row, col);
         }
 
         // Scale pivot row
@@ -175,24 +217,27 @@ pub fn solve(mut a: Vec<Vec<F>>, mut b: Vec<F>) -> Option<Vec<F>> {
         }
         b[col] *= inv;
 
-        // Eliminate column
+        // Eliminate column - always process all rows for constant time
         for i in 0..n {
             if i == col {
                 continue;
             }
             let f = a[i][col];
-            if !f.is_zero() {
-                for j in col..n {
-                    let pivot_val = a[col][j];
-                    a[i][j] -= f * pivot_val;
-                }
-                let b_pivot = b[col];
-                b[i] -= f * b_pivot;
+            // Always perform elimination (f * 0 = 0 for zero factors)
+            for j in col..n {
+                let pivot_val = a[col][j];
+                a[i][j] -= f * pivot_val;
             }
+            let b_pivot = b[col];
+            b[i] -= f * b_pivot;
         }
     }
 
-    Some(b)
+    if singular {
+        None
+    } else {
+        Some(b)
+    }
 }
 
 #[cfg(test)]

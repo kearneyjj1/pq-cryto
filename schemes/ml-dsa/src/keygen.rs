@@ -8,6 +8,7 @@ use crate::polyvec::PolyVec;
 use crate::rounding::power2round_vec;
 use crate::sampling::{expand_a, expand_s, hash_public_key};
 use rand::{CryptoRng, RngCore};
+use zeroize::Zeroize;
 
 /// ML-DSA public key.
 #[derive(Clone, Debug)]
@@ -38,6 +39,10 @@ impl PublicKey {
 }
 
 /// ML-DSA secret key.
+///
+/// # Security
+///
+/// This struct implements `Drop` to zeroize secret key material when dropped.
 #[derive(Clone, Debug)]
 pub struct SecretKey {
     /// Seed for matrix A generation.
@@ -54,6 +59,25 @@ pub struct SecretKey {
     pub t0: PolyVec,
     /// Parameter set.
     pub params: Params,
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        // Zeroize all secret material
+        self.rho.zeroize();
+        self.k.zeroize();
+        self.tr.zeroize();
+        // Zeroize polynomial vectors
+        for poly in &mut self.s1.polys {
+            poly.coeffs.zeroize();
+        }
+        for poly in &mut self.s2.polys {
+            poly.coeffs.zeroize();
+        }
+        for poly in &mut self.t0.polys {
+            poly.coeffs.zeroize();
+        }
+    }
 }
 
 impl SecretKey {
