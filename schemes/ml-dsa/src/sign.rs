@@ -35,7 +35,8 @@ impl Signature {
     pub fn to_bytes(&self, gamma1: i32, omega: usize, k: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(&self.c_tilde);
-        bytes.extend(pack_z_vec(&self.z, gamma1));
+        bytes.extend(pack_z_vec(&self.z, gamma1)
+            .expect("invalid gamma1 parameter"));
         bytes.extend(pack_hints(&self.hints, omega, k));
         bytes
     }
@@ -91,7 +92,8 @@ pub fn sign(sk: &SecretKey, message: &[u8]) -> Result<Signature> {
         let w1 = high_bits_vec(&w, params.gamma2);
 
         // Compute challenge hash c_tilde = H(μ || w1)
-        let w1_bytes = pack_w1_vec(&w1, params.gamma2);
+        let w1_bytes = pack_w1_vec(&w1, params.gamma2)
+            .expect("invalid gamma2 parameter");
         let c_tilde = hash_challenge(&mu, &w1_bytes, params.lambda);
 
         // Sample challenge polynomial c from c_tilde
@@ -210,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_sign_ml_dsa_44() {
-        let (pk, sk) = keygen(&mut OsRng, ML_DSA_44);
+        let (_pk, sk) = keygen(&mut OsRng, ML_DSA_44);
         let message = b"test message";
 
         let sig = sign(&sk, message).expect("signing should succeed");
@@ -222,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_sign_ml_dsa_65() {
-        let (pk, sk) = keygen(&mut OsRng, ML_DSA_65);
+        let (_pk, sk) = keygen(&mut OsRng, ML_DSA_65);
         let message = b"test message for ML-DSA-65";
 
         let sig = sign(&sk, message).expect("signing should succeed");
@@ -233,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_sign_ml_dsa_87() {
-        let (pk, sk) = keygen(&mut OsRng, ML_DSA_87);
+        let (_pk, sk) = keygen(&mut OsRng, ML_DSA_87);
         let message = b"test message for ML-DSA-87";
 
         let sig = sign(&sk, message).expect("signing should succeed");

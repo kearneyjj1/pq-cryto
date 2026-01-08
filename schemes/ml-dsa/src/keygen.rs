@@ -89,8 +89,11 @@ impl SecretKey {
         bytes.extend_from_slice(&self.rho);
         bytes.extend_from_slice(&self.k);
         bytes.extend_from_slice(&self.tr);
-        bytes.extend(pack_eta_vec(&self.s1, self.params.eta));
-        bytes.extend(pack_eta_vec(&self.s2, self.params.eta));
+        // Parameters are always valid ML-DSA values, so these cannot fail
+        bytes.extend(pack_eta_vec(&self.s1, self.params.eta)
+            .expect("invalid eta parameter"));
+        bytes.extend(pack_eta_vec(&self.s2, self.params.eta)
+            .expect("invalid eta parameter"));
         bytes.extend(pack_t0_vec(&self.t0));
         bytes
     }

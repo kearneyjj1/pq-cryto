@@ -149,13 +149,15 @@ pub fn unpack_t0(bytes: &[u8]) -> Result<Poly> {
 }
 
 /// Packs eta polynomial (η=2: 3 bits, η=4: 4 bits per coefficient).
-pub fn pack_eta(poly: &Poly, eta: usize) -> Vec<u8> {
-    if eta == 2 {
-        pack_eta2(poly)
-    } else if eta == 4 {
-        pack_eta4(poly)
-    } else {
-        panic!("Unsupported eta: {}", eta);
+///
+/// Returns an error if eta is not 2 or 4.
+pub fn pack_eta(poly: &Poly, eta: usize) -> Result<Vec<u8>> {
+    match eta {
+        2 => Ok(pack_eta2(poly)),
+        4 => Ok(pack_eta4(poly)),
+        _ => Err(MlDsaError::InvalidParams {
+            reason: "eta must be 2 or 4",
+        }),
     }
 }
 
@@ -259,13 +261,15 @@ pub fn unpack_eta4(bytes: &[u8]) -> Result<Poly> {
 }
 
 /// Packs z polynomial (γ1 determines bit width).
-pub fn pack_z(poly: &Poly, gamma1: i32) -> Vec<u8> {
-    if gamma1 == (1 << 17) {
-        pack_z_17(poly)
-    } else if gamma1 == (1 << 19) {
-        pack_z_19(poly)
-    } else {
-        panic!("Unsupported gamma1: {}", gamma1);
+///
+/// Returns an error if gamma1 is not 2^17 or 2^19.
+pub fn pack_z(poly: &Poly, gamma1: i32) -> Result<Vec<u8>> {
+    match gamma1 {
+        g if g == (1 << 17) => Ok(pack_z_17(poly)),
+        g if g == (1 << 19) => Ok(pack_z_19(poly)),
+        _ => Err(MlDsaError::InvalidParams {
+            reason: "gamma1 must be 2^17 or 2^19",
+        }),
     }
 }
 
@@ -397,15 +401,15 @@ fn unpack_z_19(bytes: &[u8]) -> Result<Poly> {
 }
 
 /// Packs w1 polynomial for commitment.
-pub fn pack_w1(poly: &Poly, gamma2: i32) -> Vec<u8> {
-    if gamma2 == 95232 {
-        // (q-1)/88, 6 bits per coefficient
-        pack_w1_6bit(poly)
-    } else if gamma2 == 261888 {
-        // (q-1)/32, 4 bits per coefficient
-        pack_w1_4bit(poly)
-    } else {
-        panic!("Unsupported gamma2: {}", gamma2);
+///
+/// Returns an error if gamma2 is not 95232 or 261888.
+pub fn pack_w1(poly: &Poly, gamma2: i32) -> Result<Vec<u8>> {
+    match gamma2 {
+        95232 => Ok(pack_w1_6bit(poly)),    // (q-1)/88, 6 bits per coefficient
+        261888 => Ok(pack_w1_4bit(poly)),   // (q-1)/32, 4 bits per coefficient
+        _ => Err(MlDsaError::InvalidParams {
+            reason: "gamma2 must be 95232 or 261888",
+        }),
     }
 }
 
@@ -511,33 +515,33 @@ pub fn pack_t0_vec(v: &PolyVec) -> Vec<u8> {
 }
 
 /// Packs a vector of eta polynomials.
-pub fn pack_eta_vec(v: &PolyVec, eta: usize) -> Vec<u8> {
+pub fn pack_eta_vec(v: &PolyVec, eta: usize) -> Result<Vec<u8>> {
     let bytes_per_poly = if eta == 2 { N * 3 / 8 } else { N / 2 };
     let mut bytes = Vec::with_capacity(v.len() * bytes_per_poly);
     for poly in &v.polys {
-        bytes.extend(pack_eta(poly, eta));
+        bytes.extend(pack_eta(poly, eta)?);
     }
-    bytes
+    Ok(bytes)
 }
 
 /// Packs a vector of z polynomials.
-pub fn pack_z_vec(v: &PolyVec, gamma1: i32) -> Vec<u8> {
+pub fn pack_z_vec(v: &PolyVec, gamma1: i32) -> Result<Vec<u8>> {
     let bits = if gamma1 == (1 << 17) { 18 } else { 20 };
     let bytes_per_poly = N * bits / 8;
     let mut bytes = Vec::with_capacity(v.len() * bytes_per_poly);
     for poly in &v.polys {
-        bytes.extend(pack_z(poly, gamma1));
+        bytes.extend(pack_z(poly, gamma1)?);
     }
-    bytes
+    Ok(bytes)
 }
 
 /// Packs a vector of w1 polynomials.
-pub fn pack_w1_vec(v: &PolyVec, gamma2: i32) -> Vec<u8> {
+pub fn pack_w1_vec(v: &PolyVec, gamma2: i32) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for poly in &v.polys {
-        bytes.extend(pack_w1(poly, gamma2));
+        bytes.extend(pack_w1(poly, gamma2)?);
     }
-    bytes
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -586,7 +590,7 @@ mod tests {
             poly.coeffs[i] = (i as i32 % 5) - 2; // [-2, 2]
         }
 
-        let packed = pack_eta(&poly, 2);
+        let packed = pack_eta(&poly, 2).unwrap();
         let unpacked = unpack_eta2(&packed).unwrap();
 
         for i in 0..N {
@@ -601,7 +605,7 @@ mod tests {
             poly.coeffs[i] = (i as i32 % 9) - 4; // [-4, 4]
         }
 
-        let packed = pack_eta(&poly, 4);
+        let packed = pack_eta(&poly, 4).unwrap();
         let unpacked = unpack_eta4(&packed).unwrap();
 
         for i in 0..N {
@@ -617,7 +621,7 @@ mod tests {
             poly.coeffs[i] = ((i as i32 * 1000) % (2 * gamma1)) - gamma1 + 1;
         }
 
-        let packed = pack_z(&poly, gamma1);
+        let packed = pack_z(&poly, gamma1).unwrap();
         let unpacked = unpack_z(&packed, gamma1).unwrap();
 
         for i in 0..N {
@@ -633,7 +637,7 @@ mod tests {
             poly.coeffs[i] = ((i as i32 * 2000) % (2 * gamma1)) - gamma1 + 1;
         }
 
-        let packed = pack_z(&poly, gamma1);
+        let packed = pack_z(&poly, gamma1).unwrap();
         let unpacked = unpack_z(&packed, gamma1).unwrap();
 
         for i in 0..N {

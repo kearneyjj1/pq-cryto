@@ -91,7 +91,8 @@ pub fn verify(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<()> {
     let w1_prime = use_hint_vec(&sig.hints, &w_prime, params.gamma2);
 
     // Compute c_tilde' = H(μ || w1')
-    let w1_prime_bytes = pack_w1_vec(&w1_prime, params.gamma2);
+    let w1_prime_bytes = pack_w1_vec(&w1_prime, params.gamma2)
+        .expect("invalid gamma2 parameter");
     let c_tilde_prime = hash_challenge(&mu, &w1_prime_bytes, params.lambda);
 
     // Verify c_tilde' == c_tilde
@@ -201,7 +202,8 @@ mod tests {
         println!("Differences from hints: {}", diff_count);
 
         // Compute hashes
-        let w1_prime_bytes = pack_w1_vec(&w1_with_hint, params.gamma2);
+        let w1_prime_bytes = pack_w1_vec(&w1_with_hint, params.gamma2)
+            .expect("invalid gamma2 parameter");
         let c_tilde_prime = hash_challenge(&mu, &w1_prime_bytes, params.lambda);
 
         println!("c_tilde     len={}: {:?}", sig.c_tilde.len(), &sig.c_tilde[..8]);

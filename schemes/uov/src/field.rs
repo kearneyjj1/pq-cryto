@@ -4,12 +4,19 @@
 //! x^8 + x^4 + x^3 + x + 1 (0x11B), which is the same polynomial used in AES.
 
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
+use zeroize::Zeroize;
+
+/// The reduction polynomial for GF(2^8), excluding the x^8 term.
+///
+/// This is 0x1B = x^4 + x^3 + x + 1, derived from the AES irreducible
+/// polynomial x^8 + x^4 + x^3 + x + 1 (0x11B).
+const AES_REDUCTION_POLY: u8 = 0x1b;
 
 /// An element of the finite field GF(2^8).
 ///
 /// Elements are represented as bytes, with arithmetic defined by the
 /// AES irreducible polynomial x^8 + x^4 + x^3 + x + 1.
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Zeroize)]
 pub struct F(pub u8);
 
 impl F {
@@ -126,7 +133,7 @@ impl Mul for F {
 
             // Mask for high bit reduction
             let high_bit_mask = 0u8.wrapping_sub((a >> 7) & 1);
-            a = (a << 1) ^ (0x1b & high_bit_mask);
+            a = (a << 1) ^ (AES_REDUCTION_POLY & high_bit_mask);
 
             b >>= 1;
         }

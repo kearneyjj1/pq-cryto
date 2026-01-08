@@ -11,6 +11,13 @@
 use crate::params::{N, Q, ZETA};
 use crate::reduce::freeze;
 
+/// The multiplicative inverse of N (256) modulo Q (8380417).
+///
+/// Used to scale the result of the inverse NTT.
+/// Computed as: 256^(-1) mod 8380417 = 8347681
+/// Verification: 256 * 8347681 = 2136942336 = 255 * 8380417 + 1 ≡ 1 (mod Q)
+const N_INV: i32 = 8347681;
+
 /// Computes a * b mod Q with proper handling of negative values.
 #[inline]
 fn mulmod(a: i32, b: i32) -> i32 {
@@ -116,10 +123,8 @@ pub fn inv_ntt(a: &mut [i32; N]) {
     }
 
     // Scale by n^(-1) mod q
-    // 256^(-1) mod 8380417 = 8347681
-    let n_inv = 8347681;
     for coeff in a.iter_mut() {
-        *coeff = mulmod(*coeff, n_inv);
+        *coeff = mulmod(*coeff, N_INV);
     }
 }
 

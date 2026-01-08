@@ -16,9 +16,11 @@ All implementations in this repository may be vulnerable to timing side-channel 
    - Matrix operations (Gaussian elimination)
    - Gaussian sampling
 
-2. **Floating-Point Arithmetic**: The FN-DSA (FALCON) implementation uses floating-point arithmetic which has platform-dependent timing characteristics.
+2. **Rejection Sampling Timing**: ML-DSA signing uses rejection sampling which inherently has variable execution time based on the message and key. The number of loop iterations reveals information about the signing process. This is an accepted trade-off in the standard, but callers should be aware that signing time is not constant.
 
-3. **Memory Access Patterns**: Array indexing patterns may leak information through cache timing.
+3. **Floating-Point Arithmetic**: The FN-DSA (FALCON) implementation uses floating-point arithmetic which has platform-dependent timing characteristics. The implementation assumes IEEE 754 double-precision floating-point support and may produce incorrect results on platforms with non-standard floating-point behavior (e.g., flush-to-zero mode, non-IEEE rounding).
+
+4. **Memory Access Patterns**: Array indexing patterns may leak information through cache timing.
 
 ### Implementation Gaps
 
@@ -27,6 +29,22 @@ All implementations in this repository may be vulnerable to timing side-channel 
 2. **Secret Key Handling**: While zeroization is implemented, it may not be effective against all memory disclosure attacks (e.g., speculative execution, cold boot attacks).
 
 3. **Fault Attacks**: No countermeasures against fault injection attacks are implemented.
+
+### Platform Requirements
+
+The FN-DSA (FALCON) implementation has specific platform requirements:
+
+1. **IEEE 754 Floating-Point**: Requires IEEE 754 double-precision (64-bit) floating-point arithmetic with proper rounding. May produce incorrect results on platforms with:
+   - Flush-to-zero (FTZ) mode enabled
+   - Denormals-are-zero (DAZ) mode enabled
+   - Non-default rounding modes
+   - Extended precision floating-point (x87 80-bit mode)
+
+2. **Platform Verification**: If deploying on embedded systems or unusual architectures, verify floating-point behavior first. The `f64` operations must match IEEE 754 semantics.
+
+3. **x86/x64**: Works correctly on modern x86/x64 with SSE2 (default for 64-bit Rust).
+
+4. **ARM**: Works correctly on ARMv7+ and AArch64 with standard FP configuration.
 
 ### What This Means
 

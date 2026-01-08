@@ -3,13 +3,17 @@
 //! This module implements the FALCON signature generation algorithm,
 //! which uses Fast Fourier Sampling to produce compact signatures.
 
+use std::sync::Once;
 use rand::RngCore;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
 use crate::hash::{generate_nonce, hash_to_point};
 use crate::keygen::SecretKey;
-use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE};
+use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE, FALCON_512};
 use crate::sampler::{FfSampler, SimpleSampler};
+
+/// Warning printed once for FALCON-512 relaxed bounds.
+static FALCON_512_WARNING: Once = Once::new();
 
 /// A FALCON signature.
 #[derive(Clone, Debug)]
@@ -51,6 +55,15 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     let n = sk.params.n;
     let sigma = sk.params.sigma;
     let bound_sq = sk.params.sig_bound_sq;
+
+    // Warn once if using FALCON-512 with relaxed bounds
+    if sk.params.n == FALCON_512.n && sk.params.sig_bound_sq == FALCON_512.sig_bound_sq {
+        FALCON_512_WARNING.call_once(|| {
+            eprintln!("WARNING: FALCON-512 is using relaxed signature bounds (~200x larger than standard).");
+            eprintln!("         This implementation uses simplified sampling and is NOT suitable for production.");
+            eprintln!("         See SECURITY.md for details.");
+        });
+    }
 
     // Create the FFT sampler using the Gram-Schmidt data from the secret key
     let ff_sampler = FfSampler::new(sk.gs.clone());

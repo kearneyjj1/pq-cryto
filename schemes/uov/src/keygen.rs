@@ -15,7 +15,7 @@ use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake256,
 };
-// Note: We manually zeroize F elements since F doesn't implement Zeroize
+use zeroize::Zeroize;
 
 use crate::field::F;
 use crate::matrix::{idx_ut, sample_invertible};
@@ -90,19 +90,14 @@ pub struct SecretKey {
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        // Zeroize the transformation matrix T
-        // We manually zero each element since F doesn't implement Zeroize
+        // Zeroize the transformation matrix T using the Zeroize trait
         for row in &mut self.t {
-            for elem in row.iter_mut() {
-                *elem = F::ZERO;
-            }
+            row.zeroize();
         }
 
         // Zeroize the central quadratic forms
         for form in &mut self.f_quads {
-            for elem in form.iter_mut() {
-                *elem = F::ZERO;
-            }
+            form.zeroize();
         }
     }
 }

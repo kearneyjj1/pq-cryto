@@ -12,9 +12,13 @@ use crate::field::F;
 ///
 /// For an n×n upper triangular matrix, element (i,j) where i <= j is stored at
 /// position i*n - i*(i+1)/2 + j.
+///
+/// # Panics
+///
+/// Panics if `i > j` (invalid upper triangular index).
 #[inline]
 pub fn idx_ut(n: usize, i: usize, j: usize) -> usize {
-    debug_assert!(i <= j, "idx_ut requires i <= j");
+    assert!(i <= j, "idx_ut requires i <= j, got i={}, j={}", i, j);
     i * n - (i * (i + 1)) / 2 + j
 }
 
