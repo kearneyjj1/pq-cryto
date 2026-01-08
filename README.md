@@ -2,7 +2,17 @@
 
 Rust implementations of post-quantum digital signature schemes. Built for learning and experimentation, featuring key generation, signing, verification, and comprehensive test suites.
 
-**Warning**: These implementations are for educational purposes only and have not been audited for production use.
+**Warning**: These implementations are for educational purposes only and are NOT intended for production use. See [SECURITY.md](SECURITY.md) for details.
+
+## Security Status
+
+This codebase has undergone security review with the following measures implemented:
+
+- **Secure Memory Handling**: Secret keys implement `Drop` with zeroization via the `zeroize` crate
+- **Constant-Time Operations**: GF(2^8) multiplication and matrix operations use constant-time techniques
+- **Input Validation**: All deserialization functions validate coefficient ranges and structural integrity
+- **Error Handling**: Proper `Result` types instead of panics for invalid parameters
+- **Documentation**: Comprehensive security limitations documented in [SECURITY.md](SECURITY.md)
 
 ## Implemented Schemes
 
@@ -130,9 +140,13 @@ cargo test --release
 
 ## Test Coverage
 
-- **ML-DSA**: 126 tests covering all parameter sets, roundtrip verification, tampering detection, and edge cases
-- **FN-DSA**: 100 tests covering FFT operations, NTRUSolve at various degrees (n=2 to 512), Gaussian sampling, polynomial arithmetic, and sign/verify integration
-- **UOV**: 77 tests (27 unit + 46 integration + 4 doc tests) covering all parameter sets, field arithmetic, matrix operations, tampering detection, cross-key rejection, and stress tests
+**Total: 307 tests passing**
+
+| Scheme | Tests | Coverage |
+|--------|-------|----------|
+| ML-DSA | 130 | All parameter sets (44/65/87), NTT operations, polynomial arithmetic, roundtrip verification, tampering detection, packing/unpacking, edge cases |
+| FN-DSA | 100 | FFT operations, NTRUSolve (n=2 to 512), Gaussian sampling, polynomial arithmetic, sign/verify integration |
+| UOV | 77 | 27 unit + 46 integration + 4 doc tests covering all parameter sets, GF(2^8) field arithmetic, matrix operations, tampering detection, cross-key rejection, stress tests |
 
 ## Implementation Notes
 

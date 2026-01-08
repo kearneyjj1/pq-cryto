@@ -52,6 +52,31 @@ The FN-DSA (FALCON) implementation has specific platform requirements:
 - **DO NOT** deploy these implementations in any security-sensitive context
 - **DO NOT** assume the cryptographic security proofs apply to these implementations
 
+## Security Measures Implemented
+
+The following security best practices have been implemented:
+
+### Memory Safety
+- **Secret Key Zeroization**: All secret key types implement `Drop` trait with secure zeroization using the `zeroize` crate
+- **ML-DSA**: `SecretKey` zeroizes `rho`, `k`, `tr`, `s1`, `s2`, and `t0` polynomials
+- **FN-DSA**: `SecretKey` zeroizes `f`, `g`, `F`, `G`, `h`, and all FFT data
+- **UOV**: `SecretKey` zeroizes transformation matrix `t` and quadratic forms `f_quads`
+
+### Constant-Time Operations
+- **GF(2^8) Multiplication**: Uses fixed 8-iteration loop with arithmetic masking (no data-dependent branches)
+- **Matrix Operations**: `mat_mul`, `rank`, and `solve` use constant-time pivot selection and elimination
+- **CDT Sampling**: Base Gaussian sampler uses linear scan with arithmetic masking
+
+### Input Validation
+- **Coefficient Range Checks**: All unpacking functions validate coefficient bounds
+- **Structural Validation**: Deserialization validates lengths, indices, and duplicate detection
+- **Error Types**: Granular `VerificationFailure` enums provide debugging info without creating oracles
+
+### Code Quality
+- **No Panics**: Pack functions return `Result` types instead of panicking on invalid parameters
+- **Bounds Checking**: Security-critical functions use `assert!` (not `debug_assert!`) for release-mode safety
+- **Named Constants**: Magic numbers replaced with documented constants
+
 ## Security Guarantees
 
 This implementation provides:
@@ -59,14 +84,16 @@ This implementation provides:
 - Functionally correct cryptographic operations (signatures verify correctly)
 - Educational demonstration of post-quantum signature algorithms
 - A starting point for learning about lattice-based and multivariate cryptography
+- Secure memory handling for secret key material
+- Constant-time field and matrix operations where implemented
 
 This implementation does NOT provide:
 
-- Protection against timing side-channel attacks
+- Full protection against all timing side-channel attacks (rejection sampling timing varies)
 - Protection against power analysis or electromagnetic emanation attacks
 - Protection against fault injection attacks
-- Guaranteed constant-time execution
-- Memory-safe handling of secrets in all scenarios
+- Guaranteed constant-time execution for all operations
+- Memory-safe handling of secrets against all attack vectors (e.g., speculative execution)
 
 ## Threat Model
 
@@ -103,6 +130,8 @@ These implementations have undergone more rigorous security review and testing.
 | Version | Date | Changes |
 |---------|------|---------|
 | 0.1.0 | 2026-01-08 | Initial security documentation |
+| 0.2.0 | 2026-01-08 | Security audit remediation: constant-time GF(2^8) multiplication, zeroization for all secret keys, input validation, error handling improvements |
+| 0.2.1 | 2026-01-08 | Follow-up audit fixes: Result-based error handling, release-mode bounds checking, named constants, platform requirements documentation, FALCON-512 runtime warnings |
 
 ## References
 
