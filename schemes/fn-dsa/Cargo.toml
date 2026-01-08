@@ -1,0 +1,21 @@
+[package]
+name = "pqsigs-fn-dsa"
+version = "0.1.0"
+edition = "2021"
+description = "FN-DSA (FALCON) lattice-based post-quantum signature scheme"
+license = "MIT"
+repository = "https://github.com/jkearney/pq-cryto"
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"
+num-bigint = "0.4"
+num-traits = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hex = "0.4"
+
+[[bench]]
+name = "fn_dsa_bench"
+harness = false
