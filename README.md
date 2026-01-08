@@ -27,6 +27,28 @@ let sig = sign(&sk, b"message").unwrap();
 assert!(verify(&pk, b"message", &sig).is_ok());
 ```
 
+### FN-DSA (FALCON)
+
+Fast Fourier Lattice-based Compact Signatures over NTRU, a NIST post-quantum signature standard.
+
+**Security basis**: Hardness of the Short Integer Solution (SIS) problem over NTRU lattices.
+
+| Parameter Set | Security Level | Public Key | Secret Key | Signature |
+|---------------|----------------|------------|------------|-----------|
+| FALCON-512    | NIST Level 1   | 897 B      | 1,281 B    | ~666 B    |
+| FALCON-1024   | NIST Level 5   | 1,793 B    | 2,305 B    | ~1,280 B  |
+
+```rust
+use pqsigs_fn_dsa::{keygen_512, sign, verify};
+use rand::rngs::OsRng;
+
+let keypair = keygen_512(&mut OsRng).unwrap();
+let sig = sign(&mut OsRng, &keypair.sk, b"message").unwrap();
+assert!(verify(&keypair.pk, b"message", &sig).is_ok());
+```
+
+**Note**: This is an educational implementation with relaxed signature bounds. Production FALCON requires the full `ffSampling` algorithm for cryptographic security.
+
 ### UOV (Unbalanced Oil and Vinegar)
 
 Multivariate quadratic signature scheme, a candidate in the NIST Additional Digital Signatures competition.
@@ -63,6 +85,17 @@ pq-crypto/
 │   │       ├── sign.rs      # Signing with Fiat-Shamir
 │   │       └── verify.rs    # Verification
 │   │
+│   ├── fn-dsa/          # FN-DSA (FALCON) implementation
+│   │   └── src/
+│   │       ├── fft.rs       # FFT for polynomial ring arithmetic
+│   │       ├── ntru.rs      # NTRUSolve algorithm
+│   │       ├── poly.rs      # Polynomial operations with NTT
+│   │       ├── gaussian.rs  # Discrete Gaussian sampling
+│   │       ├── sampler.rs   # FFT sampler for signing
+│   │       ├── keygen.rs    # Key generation with NTRU equation
+│   │       ├── sign.rs      # Signature generation
+│   │       └── verify.rs    # Verification
+│   │
 │   └── uov/             # UOV implementation
 │       └── src/
 │           ├── field.rs     # GF(2^8) arithmetic
@@ -80,11 +113,16 @@ Each scheme is a separate Cargo workspace member:
 ```bash
 # Build all schemes
 cd schemes/ml-dsa && cargo build
+cd schemes/fn-dsa && cargo build
 cd schemes/uov && cargo build
 
 # Run tests
 cd schemes/ml-dsa && cargo test
+cd schemes/fn-dsa && cargo test
 cd schemes/uov && cargo test
+
+# Run FALCON-512 integration test
+cd schemes/fn-dsa && cargo run --bin falcon512_test
 
 # Run with optimizations (recommended for benchmarking)
 cargo test --release
@@ -93,6 +131,7 @@ cargo test --release
 ## Test Coverage
 
 - **ML-DSA**: 126 tests covering all parameter sets, roundtrip verification, tampering detection, and edge cases
+- **FN-DSA**: 100 tests covering FFT operations, NTRUSolve at various degrees (n=2 to 512), Gaussian sampling, polynomial arithmetic, and sign/verify integration
 - **UOV**: 77 tests (27 unit + 46 integration + 4 doc tests) covering all parameter sets, field arithmetic, matrix operations, tampering detection, cross-key rejection, and stress tests
 
 ## Implementation Notes
@@ -103,6 +142,13 @@ cargo test --release
 - Deterministic signing using SHAKE256
 - Implements the "Fiat-Shamir with Aborts" paradigm
 
+### FN-DSA (FALCON)
+- Implements recursive NTRUSolve algorithm for finding F, G such that fG - gF = q
+- Uses FFT/iFFT for fast polynomial arithmetic in the negacyclic ring Z[X]/(X^n + 1)
+- Modular arithmetic over Z_q with q = 12289 (NTT-friendly prime)
+- Discrete Gaussian sampling using the ziggurat method
+- **Educational note**: Uses relaxed signature bounds; production use requires full `ffSampling`
+
 ### UOV
 - Implements GF(2^8) field arithmetic with irreducible polynomial x^8 + x^4 + x^3 + x + 1
 - Uses SHAKE256 for deterministic key expansion
@@ -111,8 +157,10 @@ cargo test --release
 ## References
 
 - [FIPS 204: ML-DSA Standard](https://csrc.nist.gov/pubs/fips/204/final)
+- [FIPS 206: FN-DSA (FALCON) Standard](https://csrc.nist.gov/pubs/fips/206/final)
 - [NIST Post-Quantum Cryptography](https://csrc.nist.gov/projects/post-quantum-cryptography)
 - [NIST Additional Digital Signatures](https://csrc.nist.gov/projects/pqc-dig-sig)
+- [FALCON Specification](https://falcon-sign.info/)
 
 ## License
 
