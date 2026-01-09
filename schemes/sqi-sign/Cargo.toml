@@ -1,0 +1,25 @@
+[package]
+name = "pqsigs-sqi-sign"
+version = "0.1.0"
+edition = "2021"
+authors = ["pq-crypto contributors"]
+description = "Educational implementation of SQI-SIGN isogeny-based signature scheme"
+license = "MIT OR Apache-2.0"
+keywords = ["cryptography", "post-quantum", "signature", "isogeny", "sqisign"]
+categories = ["cryptography"]
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+lazy_static = "1.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sqi_sign_bench"
+harness = false
