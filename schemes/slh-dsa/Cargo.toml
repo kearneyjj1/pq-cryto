@@ -1,0 +1,21 @@
+[package]
+name = "pqsigs-slh-dsa"
+version = "0.1.0"
+edition = "2021"
+description = "SLH-DSA (Stateless Hash-based Digital Signature Algorithm) post-quantum signature scheme - FIPS 205"
+license = "MIT"
+keywords = ["cryptography", "post-quantum", "signature", "slh-dsa", "sphincs"]
+categories = ["cryptography"]
+
+[dependencies]
+rand = "0.8"
+sha3 = "0.10"
+zeroize = { version = "1.7", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hex = "0.4"
+
+# [[bench]]
+# name = "slh_dsa_bench"
+# harness = false
