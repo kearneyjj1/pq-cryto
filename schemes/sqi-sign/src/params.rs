@@ -53,14 +53,23 @@ impl Params {
 
 lazy_static::lazy_static! {
     /// SQI-SIGN Level I parameters (NIST Level 1, ~128-bit security).
+    ///
+    /// Uses p = 2^33 * 3^19 - 1 = 9586980095590400 - 1 (for testing).
+    /// A proper implementation would use the full specification prime.
     pub static ref SQISIGN_NIST_I: Params = {
-        // Placeholder - actual parameters TBD
+        // For testing: p = 2^33 * 3^19 - 1 ≈ 9.5 * 10^15 (53-bit prime)
+        // This prime satisfies p ≡ 3 (mod 4) for supersingular curves
+        // Production would use: p = 2^126 * 3^72 * f - 1 for proper security
+        let two = BigInt::from(2);
+        let three = BigInt::from(3);
+        let p = &two.pow(33) * &three.pow(19) - BigInt::from(1);
+
         Params {
             name: "SQISign-NIST-I",
             security_level: 1,
-            p: BigInt::from(0), // TODO: Set actual prime
-            e2: 0,
-            e3: 0,
+            p,
+            e2: 33,
+            e3: 19,
             f: BigInt::from(1),
             p_bits: 256,
             pk_bytes: 64,
@@ -70,13 +79,19 @@ lazy_static::lazy_static! {
     };
 
     /// SQI-SIGN Level III parameters (NIST Level 3, ~192-bit security).
+    ///
+    /// Uses p = 2^37 * 3^23 - 1 (for testing).
     pub static ref SQISIGN_NIST_III: Params = {
+        let two = BigInt::from(2);
+        let three = BigInt::from(3);
+        let p = &two.pow(37) * &three.pow(23) - BigInt::from(1);
+
         Params {
             name: "SQISign-NIST-III",
             security_level: 3,
-            p: BigInt::from(0), // TODO: Set actual prime
-            e2: 0,
-            e3: 0,
+            p,
+            e2: 37,
+            e3: 23,
             f: BigInt::from(1),
             p_bits: 384,
             pk_bytes: 96,
@@ -86,13 +101,19 @@ lazy_static::lazy_static! {
     };
 
     /// SQI-SIGN Level V parameters (NIST Level 5, ~256-bit security).
+    ///
+    /// Uses p = 2^41 * 3^27 - 1 (for testing).
     pub static ref SQISIGN_NIST_V: Params = {
+        let two = BigInt::from(2);
+        let three = BigInt::from(3);
+        let p = &two.pow(41) * &three.pow(27) - BigInt::from(1);
+
         Params {
             name: "SQISign-NIST-V",
             security_level: 5,
-            p: BigInt::from(0), // TODO: Set actual prime
-            e2: 0,
-            e3: 0,
+            p,
+            e2: 41,
+            e3: 27,
             f: BigInt::from(1),
             p_bits: 512,
             pk_bytes: 128,

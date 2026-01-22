@@ -40,6 +40,10 @@ pub enum SqiSignError {
         /// Reason for failure.
         reason: &'static str,
     },
+    /// Invalid public key.
+    InvalidPublicKey,
+    /// Invalid secret key.
+    InvalidSecretKey,
 }
 
 impl fmt::Display for SqiSignError {
@@ -56,6 +60,8 @@ impl fmt::Display for SqiSignError {
                 write!(f, "Quaternion algebra error: {}", reason)
             }
             Self::IdealError { reason } => write!(f, "Ideal computation error: {}", reason),
+            Self::InvalidPublicKey => write!(f, "Invalid public key"),
+            Self::InvalidSecretKey => write!(f, "Invalid secret key"),
         }
     }
 }
