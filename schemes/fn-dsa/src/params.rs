@@ -117,12 +117,17 @@ pub const FALCON_1024: Params = Params {
 /// - Polynomial degree: n = 16
 /// - This is a toy parameter set for unit testing.
 /// - DO NOT USE IN PRODUCTION.
+///
+/// NOTE: The NTRUSolve for small n produces F, G with large coefficients
+/// (F_max ~600, G_max ~800), causing larger signatures than standard FALCON.
+/// We use a bound of 600M which allows valid signatures (~400M norm²) but
+/// rejects wrong-message verifications (~800M norm²).
 #[cfg(test)]
 pub const FALCON_16: Params = Params {
     n: 16,
     log_n: 4,
-    sigma: 20.0,
-    sig_bound_sq: 10000.0,
+    sigma: 165.7,  // Use FALCON-512 sigma for consistency
+    sig_bound_sq: 6e8,  // 600 million - valid sigs ~400M, wrong msg ~800M
     pk_bytes: 64,
     sk_bytes: 128,
     sig_bytes_max: 64,

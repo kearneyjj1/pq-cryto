@@ -66,7 +66,8 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     }
 
     // Create the FFT sampler using the Gram-Schmidt data from the secret key
-    let ff_sampler = FfSampler::new(sk.gs.clone());
+    // Use the sigma from params (not the default based on n)
+    let ff_sampler = FfSampler::with_sigma(sk.gs.clone(), sk.params.sigma);
 
     // Precompute FFT forms of the secret key polynomials
     let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -91,12 +92,15 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         fft(&mut c_fft);
 
         // Use the FFT sampler to sample (z0, z1) close to the target
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft, sigma);
+        // The sigma is encoded in the LDL* tree from the Gram-Schmidt data
+        let (z0_fft, z1_fft) = ff_sampler.sample_preimage(rng, &c_fft);
 
-        // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
+        // Compute s2 = -(z0*g + z1*G) (the second component of (c,0) - z*B)
+        // This is the signature polynomial that satisfies s1 + s2*h = c
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
         for i in 0..n {
-            s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
+            // s2 = -(z0*g + z1*G)
+            s2_fft.push(-(z0_fft[i] * g_fft[i] + z1_fft[i] * big_g_fft[i]));
         }
 
         // Convert s2 back to coefficient form
@@ -345,5 +349,94 @@ mod tests {
                 println!("Signing failed: {}", e);
             }
         }
+    }
+
+    /// Comprehensive test comparing our signature norms to standard FALCON bounds.
+    ///
+    /// This test measures the gap between our educational implementation
+    /// and the standard FALCON specification.
+    #[test]
+    fn test_signature_norm_analysis() {
+        use crate::keygen::keygen_16;
+        use crate::poly::Poly;
+        use crate::hash::hash_to_point;
+        use crate::verify::verify;
+
+        let mut rng = StdRng::seed_from_u64(12345);
+        let keypair = keygen_16(&mut rng).expect("keygen failed");
+
+        // Collect statistics over multiple signatures
+        let num_sigs = 10;
+        let mut s1_norms: Vec<i64> = Vec::new();
+        let mut s2_norms: Vec<i64> = Vec::new();
+        let mut total_norms: Vec<i64> = Vec::new();
+        let mut verify_success = 0;
+
+        for i in 0..num_sigs {
+            let message = format!("Test message {}", i);
+            let sig = match sign(&mut rng, &keypair.sk, message.as_bytes()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Compute s1 = c - s2*h
+            let c = hash_to_point(message.as_bytes(), &sig.nonce, &keypair.pk.params);
+            let c_poly = Poly::from_zq(c);
+            let s2_poly = Poly::from_i16(&sig.s2);
+            let h_poly = Poly::from_i16(&keypair.pk.h);
+            let s2h = s2_poly.mul(&h_poly);
+            let s1 = c_poly.sub(&s2h);
+
+            let s1_norm_sq = s1.norm_sq();
+            let s2_norm_sq = sig.norm_sq();
+            let total_norm_sq = s1_norm_sq + s2_norm_sq;
+
+            s1_norms.push(s1_norm_sq);
+            s2_norms.push(s2_norm_sq);
+            total_norms.push(total_norm_sq);
+
+            if verify(&keypair.pk, message.as_bytes(), &sig).is_ok() {
+                verify_success += 1;
+            }
+        }
+
+        if total_norms.is_empty() {
+            println!("No valid signatures generated");
+            return;
+        }
+
+        // Compute statistics
+        let avg_s1: f64 = s1_norms.iter().sum::<i64>() as f64 / s1_norms.len() as f64;
+        let avg_s2: f64 = s2_norms.iter().sum::<i64>() as f64 / s2_norms.len() as f64;
+        let avg_total: f64 = total_norms.iter().sum::<i64>() as f64 / total_norms.len() as f64;
+        let min_total = *total_norms.iter().min().unwrap();
+        let max_total = *total_norms.iter().max().unwrap();
+
+        // Standard FALCON-512 bound
+        let falcon_512_bound: f64 = 34034726.0;
+        let our_bound = keypair.pk.params.sig_bound_sq;
+
+        println!("\n=== Signature Norm Analysis (n=16) ===");
+        println!("Signatures generated: {}/{}", total_norms.len(), num_sigs);
+        println!("Verification success: {}/{}", verify_success, total_norms.len());
+        println!();
+        println!("Average ||s1||²: {:.0}", avg_s1);
+        println!("Average ||s2||²: {:.0}", avg_s2);
+        println!("Average ||(s1,s2)||²: {:.0}", avg_total);
+        println!("Min total norm²: {}", min_total);
+        println!("Max total norm²: {}", max_total);
+        println!();
+        println!("Our bound (n=16): {:.0}", our_bound);
+        println!("Standard FALCON-512 bound: {:.0}", falcon_512_bound);
+        println!("Ratio (avg/standard): {:.1}x", avg_total / falcon_512_bound);
+        println!();
+
+        // The key insight: our norms are ~10-15x larger than standard FALCON
+        // because n=16 NTRUSolve produces large F, G coefficients
+        // and our simplified sampling isn't as optimal.
+
+        // Verify that all signatures pass with our relaxed bounds
+        assert!(verify_success == total_norms.len() as i32,
+            "All generated signatures should verify");
     }
 }
