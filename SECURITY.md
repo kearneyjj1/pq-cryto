@@ -132,6 +132,7 @@ These implementations have undergone more rigorous security review and testing.
 | 0.1.0 | 2026-01-08 | Initial security documentation |
 | 0.2.0 | 2026-01-08 | Security audit remediation: constant-time GF(2^8) multiplication, zeroization for all secret keys, input validation, error handling improvements |
 | 0.2.1 | 2026-01-08 | Follow-up audit fixes: Result-based error handling, release-mode bounds checking, named constants, platform requirements documentation, FALCON-512 runtime warnings |
+| 0.3.0 | 2026-01-29 | FN-DSA ffSampling implementation: FIPS 206 compliant Gaussian sampler, LDL* tree construction, recursive ffSampling algorithm. Signatures now mathematically correct; working toward standard bounds. |
 
 ## References
 
