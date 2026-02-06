@@ -21,8 +21,9 @@ pub const SIGMA_0: f64 = 1.8205;
 /// sigma_min = 1.277833697 per FIPS 206.
 pub const SIGMA_MIN: f64 = 1.277833697;
 
-/// Precomputed 1 / (2 * sigma_0^2) for the BerExp rejection test.
-const INV_2SIGMA0_SQ: f64 = 0.150_868_809_571_805_55;
+/// 1 / (2 * sigma_0^2) for the BerExp rejection test.
+/// Computed from SIGMA_0 to ensure internal consistency with the RCDT table.
+const INV_2SIGMA0_SQ: f64 = 1.0 / (2.0 * SIGMA_0 * SIGMA_0);
 
 /// Maximum deviation from the mean (in units of sigma) that we consider.
 /// Values beyond this are essentially zero probability.

@@ -361,8 +361,26 @@ pub fn encode_signature_compressed(sig: &Signature, n: usize) -> Vec<u8> {
             bit_buffer |= low << bit_count;
             bit_count += k;
 
-            // Unary: high zeros followed by a 1
-            bit_count += high as usize; // high zero bits (buffer already 0)
+            // Flush before unary to prevent bit_count + high + 1 from exceeding 64
+            while bit_count >= 8 {
+                bytes.push((bit_buffer & 0xFF) as u8);
+                bit_buffer >>= 8;
+                bit_count -= 8;
+            }
+
+            // Unary: high zeros followed by a 1.
+            // Emit one bit at a time, flushing as needed, to handle
+            // arbitrarily large high values without overflowing u64.
+            for _ in 0..high {
+                // zero bit (buffer already 0 at bit_count)
+                bit_count += 1;
+                if bit_count >= 8 {
+                    bytes.push((bit_buffer & 0xFF) as u8);
+                    bit_buffer >>= 8;
+                    bit_count -= 8;
+                }
+            }
+            // terminating 1
             bit_buffer |= 1u64 << bit_count;
             bit_count += 1;
         }

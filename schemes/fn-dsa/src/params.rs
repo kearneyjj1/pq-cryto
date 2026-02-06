@@ -90,8 +90,8 @@ pub const FALCON_512: Params = Params {
     sigma: 165.7366171829776,
     sigma_min: 1.2778336969128337,
     // sig_bound^2 per FIPS 206: floor(beta^2 * 2n * sigma^2)
-    // = floor(1.1^2 * 2 * 512 * 165.7366...^2) ≈ 34,034,726
-    sig_bound_sq: 34_034_726.0,
+    // = floor(1.1^2 * 2 * 512 * 165.7366171829776^2) = 34,034,727
+    sig_bound_sq: 34_034_727.0,
     pk_bytes: 897,
     sk_bytes: 1281,
     sig_bytes_max: 809, // Worst case, typical is ~666
