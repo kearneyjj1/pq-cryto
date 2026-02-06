@@ -29,13 +29,13 @@ pub fn verify(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<()> {
     let c = hash_to_point(message, &sig.nonce, &pk.params);
 
     // Compute s1 = c - s2 * h mod q
-    // Convert to polynomials and use FFT multiplication
+    // Use NTT multiplication for exact modular arithmetic (no floating-point rounding)
     let c_poly = Poly::from_zq(c);
     let s2_poly = Poly::from_i16(&sig.s2);
     let h_poly = Poly::from_i16(&pk.h);
 
-    // s2 * h
-    let s2h = s2_poly.mul(&h_poly);
+    // s2 * h (exact via NTT)
+    let s2h = s2_poly.mul_ntt(&h_poly);
 
     // s1 = c - s2*h
     let s1 = c_poly.sub(&s2h);
@@ -54,6 +54,7 @@ pub fn verify(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<()> {
 }
 
 /// Verifies a signature and returns the computed s1 (for debugging).
+#[cfg(test)]
 pub fn verify_debug(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<(Poly, i64)> {
     let n = pk.params.n;
     let bound_sq = pk.params.sig_bound_sq;
@@ -67,7 +68,7 @@ pub fn verify_debug(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<(
     let s2_poly = Poly::from_i16(&sig.s2);
     let h_poly = Poly::from_i16(&pk.h);
 
-    let s2h = s2_poly.mul(&h_poly);
+    let s2h = s2_poly.mul_ntt(&h_poly);
     let s1 = c_poly.sub(&s2h);
 
     let s1_norm_sq = s1.norm_sq();
@@ -248,39 +249,60 @@ mod tests {
         }
     }
 
-    // Full integration test with FALCON-512 (requires working NTRUSolve for large n)
+    // Full sign-then-verify integration test for FALCON-512
     #[test]
-    #[ignore]
     fn test_verify_falcon_512() {
         use crate::keygen::keygen_512;
         use crate::sign::sign;
         use rand::SeedableRng;
         use rand::rngs::StdRng;
 
-        // Use a seed that is known to find valid NTRU pairs
         let mut rng = StdRng::seed_from_u64(42);
 
-        let keypair = match keygen_512(&mut rng) {
-            Ok(kp) => kp,
-            Err(e) => {
-                println!("Keygen failed (expected for incomplete impl): {}", e);
-                return;
-            }
-        };
+        let keypair = keygen_512(&mut rng).expect("FALCON-512 keygen must succeed");
 
         let message = b"Hello, FALCON!";
-        let sig = match sign(&mut rng, &keypair.sk, message) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("Signing failed (expected for incomplete impl): {}", e);
-                return;
-            }
-        };
+        let sig = sign(&mut rng, &keypair.sk, message).expect("FALCON-512 signing must succeed");
 
-        let result = verify(&keypair.pk, message, &sig);
-        match result {
-            Ok(()) => println!("FALCON-512 verification succeeded!"),
-            Err(e) => println!("Verification failed: {}", e),
+        // Correct message must verify
+        verify(&keypair.pk, message, &sig).expect("FALCON-512 verification must succeed");
+
+        // Wrong message must fail verification
+        let wrong_message = b"Wrong message!";
+        let wrong_result = verify(&keypair.pk, wrong_message, &sig);
+        assert!(
+            wrong_result.is_err(),
+            "Verification of wrong message must fail for FALCON-512"
+        );
+    }
+
+    // Sign multiple distinct messages and verify each
+    #[test]
+    fn test_falcon_512_multi_message() {
+        use crate::keygen::keygen_512;
+        use crate::sign::sign;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let keypair = keygen_512(&mut rng).expect("keygen must succeed");
+
+        let messages: &[&[u8]] = &[
+            b"Message one",
+            b"Message two",
+            b"Message three",
+        ];
+
+        for msg in messages {
+            let sig = sign(&mut rng, &keypair.sk, msg).expect("signing must succeed");
+            verify(&keypair.pk, msg, &sig).expect("verification must succeed");
+
+            // Cross-verify: each signature must fail against a different message
+            let other = if *msg == b"Message one" { &b"Message two"[..] } else { &b"Message one"[..] };
+            assert!(
+                verify(&keypair.pk, other, &sig).is_err(),
+                "Cross-message verification must fail"
+            );
         }
     }
 }

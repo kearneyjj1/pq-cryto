@@ -33,6 +33,7 @@ use crate::fft::{ifft, merge_fft, split_fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::gaussian::SamplerZ;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 /// The Fast Fourier Sampler (FIPS 206 ffSampling).
 ///
@@ -136,18 +137,22 @@ impl FfSampler {
             };
             let l10_val = node.l10[0];
 
-            // Sample z1 (both real and imaginary parts independently)
+            // Sample z1 (real part only).
+            //
+            // With the Falcon tree-ordered FFT, the interleaved split_fft
+            // decomposes conjugate pairs at each level.  At the n=1 leaves
+            // the target values are purely real, so only the real part is
+            // sampled.  This yields 2n total samples (matching the reference
+            // implementation) and the correct expected signature norm.
             let z1_re = self.sampler_z.sample(rng, t1[0].re, sigma_1) as f64;
-            let z1_im = self.sampler_z.sample(rng, t1[0].im, sigma_1) as f64;
-            let z1 = Complex::new(z1_re, z1_im);
+            let z1 = Complex::from_real(z1_re);
 
             // Condition: t0' = t0 + l10 * (t1 - z1)
             let t0_cond = t0[0] + l10_val * (t1[0] - z1);
 
-            // Sample z0
+            // Sample z0 (real part only, same reasoning as z1)
             let z0_re = self.sampler_z.sample(rng, t0_cond.re, sigma_0) as f64;
-            let z0_im = self.sampler_z.sample(rng, t0_cond.im, sigma_0) as f64;
-            let z0 = Complex::new(z0_re, z0_im);
+            let z0 = Complex::from_real(z0_re);
 
             return (vec![z0], vec![z1]);
         }
@@ -155,26 +160,36 @@ impl FfSampler {
         // Recursive case: split, condition, and recurse
         let node = self.gs.tree.get_node(level, pos);
         // Clone l10 since we need it after the mutable borrow in recursion
-        let l10: Vec<Complex> = node.l10.clone();
+        let mut l10: Vec<Complex> = node.l10.clone();
 
         // 1. Split t1 and recurse on RIGHT subtree
-        let (t1_even, t1_odd) = split_fft(t1);
-        let (z1_even, z1_odd) = self.ff_sampling_recursive(
+        let (mut t1_even, mut t1_odd) = split_fft(t1);
+        let (mut z1_even, mut z1_odd) = self.ff_sampling_recursive(
             rng, &t1_even, &t1_odd, level + 1, 2 * pos + 1,
         );
+        t1_even.zeroize();
+        t1_odd.zeroize();
         let z1 = merge_fft(&z1_even, &z1_odd);
+        z1_even.zeroize();
+        z1_odd.zeroize();
 
         // 2. Condition: t0' = t0 + l10 * (t1 - z1) pointwise
-        let t0_cond: Vec<Complex> = (0..n)
+        let mut t0_cond: Vec<Complex> = (0..n)
             .map(|i| t0[i] + l10[i] * (t1[i] - z1[i]))
             .collect();
+        l10.zeroize();
 
         // 3. Split conditioned t0' and recurse on LEFT subtree
-        let (t0p_even, t0p_odd) = split_fft(&t0_cond);
-        let (z0_even, z0_odd) = self.ff_sampling_recursive(
+        let (mut t0p_even, mut t0p_odd) = split_fft(&t0_cond);
+        t0_cond.zeroize();
+        let (mut z0_even, mut z0_odd) = self.ff_sampling_recursive(
             rng, &t0p_even, &t0p_odd, level + 1, 2 * pos,
         );
+        t0p_even.zeroize();
+        t0p_odd.zeroize();
         let z0 = merge_fft(&z0_even, &z0_odd);
+        z0_even.zeroize();
+        z0_odd.zeroize();
 
         (z0, z1)
     }

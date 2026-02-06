@@ -44,6 +44,12 @@ pub struct Params {
     /// Maximum signature size in bytes.
     pub sig_bytes_max: usize,
 
+    /// Golomb-Rice parameter k for signature compression.
+    /// Low k bits of each coefficient's absolute value are coded in binary;
+    /// the remaining high bits are coded in unary. k = 8 for FALCON-512,
+    /// k = 9 for FALCON-1024.
+    pub rice_k: usize,
+
     /// NIST security level (1 or 5).
     pub security_level: usize,
 }
@@ -89,6 +95,7 @@ pub const FALCON_512: Params = Params {
     pk_bytes: 897,
     sk_bytes: 1281,
     sig_bytes_max: 809, // Worst case, typical is ~666
+    rice_k: 8,
     security_level: 1,
 };
 
@@ -112,6 +119,7 @@ pub const FALCON_1024: Params = Params {
     pk_bytes: 1793,
     sk_bytes: 2305,
     sig_bytes_max: 1577, // Worst case, typical is ~1280
+    rice_k: 9,
     security_level: 5,
 };
 
@@ -135,6 +143,7 @@ pub const FALCON_16: Params = Params {
     pk_bytes: 64,
     sk_bytes: 128,
     sig_bytes_max: 64,
+    rice_k: 8,
     security_level: 0, // Not secure
 };
 

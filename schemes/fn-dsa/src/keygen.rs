@@ -4,12 +4,11 @@
 //! which produces a public/secret key pair from random input.
 
 use rand::{Rng, RngCore};
-use zeroize::Zeroize;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::field::Zq;
-use crate::gaussian::SamplerZ;
+use crate::gaussian::sample_keygen_gaussian;
 use crate::ntru::ntru_solve;
 use crate::params::{Params, Q, FALCON_512, FALCON_1024};
 use crate::poly::ntt;
@@ -35,6 +34,12 @@ impl PublicKey {
 /// # Security
 ///
 /// This struct implements `Drop` to zeroize secret key material when dropped.
+///
+/// **Cloning warning**: When a `SecretKey` is cloned, the clone contains an
+/// independent copy of all secret material (polynomials `f`, `g`, `F`, `G`
+/// and the Gram-Schmidt / LDL* tree). Both the original and the clone must
+/// be dropped for complete zeroization of secret data from memory. Avoid
+/// cloning unless necessary (e.g., for a separate signing context).
 #[derive(Clone)]
 pub struct SecretKey {
     /// The polynomial f (small coefficients).
@@ -57,6 +62,7 @@ pub struct SecretKey {
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
+        use zeroize::Zeroize;
         // Zeroize all secret polynomials
         self.f.zeroize();
         self.g.zeroize();
@@ -64,11 +70,16 @@ impl Drop for SecretKey {
         self.big_g.zeroize();
         // Note: h is public, but we zeroize it anyway
         self.h.zeroize();
-        // Zeroize Gram-Schmidt data (contains FFT of secret polynomials)
-        self.gs.f_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
-        self.gs.g_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
-        self.gs.big_f_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
-        self.gs.big_g_fft.iter_mut().for_each(|c| *c = Complex::ZERO);
+        // Zeroize Gram-Schmidt FFT data (contains FFT of secret polynomials)
+        self.gs.f_fft.zeroize();
+        self.gs.g_fft.zeroize();
+        self.gs.big_f_fft.zeroize();
+        self.gs.big_g_fft.zeroize();
+        // Zeroize sigma values (derived from secret basis)
+        self.gs.sigma_fg.zeroize();
+        self.gs.sigma_FG.zeroize();
+        // Zeroize FFT tree nodes (contain LDL* decomposition of secret basis)
+        self.gs.tree.zeroize_tree();
     }
 }
 
@@ -80,6 +91,11 @@ impl SecretKey {
 }
 
 /// A FALCON key pair.
+///
+/// # Security
+///
+/// Cloning a `KeyPair` clones the embedded [`SecretKey`]. See the security
+/// notes on `SecretKey` regarding independent zeroization of cloned copies.
 #[derive(Clone)]
 pub struct KeyPair {
     /// The public key.
@@ -111,14 +127,17 @@ fn optimal_weight(n: usize) -> usize {
 /// Generates a random polynomial with small coefficients using discrete Gaussian sampling.
 ///
 /// Coefficients are sampled from a discrete Gaussian distribution N(0, sigma^2)
-/// using the FIPS 206 SamplerZ algorithm (Algorithm 12).
+/// using rejection sampling (`sample_keygen_gaussian`).
+///
+/// Note: The FIPS 206 SamplerZ (Algorithm 12) cannot be used here because its
+/// base sampler at sigma_0=1.82 has lighter tails than the keygen sigma≈4.05,
+/// causing incorrect variance. SamplerZ is designed for the signing path where
+/// sigma ≈ sigma_min ≈ 1.28 < sigma_0.
 fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8> {
-    let sampler = SamplerZ::new();
     let mut poly = vec![0i8; n];
 
     for i in 0..n {
-        // Sample from discrete Gaussian using FIPS 206 SamplerZ
-        let z = sampler.sample(rng, 0.0, sigma);
+        let z = sample_keygen_gaussian(rng, sigma);
         // Clamp to i8 range (coefficients should be small, but clamp for safety)
         poly[i] = z.clamp(-127, 127) as i8;
     }
@@ -131,14 +150,15 @@ fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8>
 /// Uses a hybrid approach: mostly small Gaussian coefficients with a few
 /// larger values to ensure good algebraic properties.
 fn generate_ntru_poly<R: RngCore>(rng: &mut R, n: usize, ensure_odd: bool) -> Vec<i8> {
-    let sampler = SamplerZ::new();
     let mut poly = vec![0i8; n];
 
-    // Use smaller sigma for most coefficients
+    // Use smaller sigma for most coefficients.
+    // Uses sample_keygen_gaussian (rejection sampler) since these sigmas
+    // are below sigma_min=1.278, which SamplerZ cannot handle correctly.
     let sigma = if n <= 64 { 1.2 } else { 1.0 };
 
     for i in 0..n {
-        let z = sampler.sample(rng, 0.0, sigma);
+        let z = sample_keygen_gaussian(rng, sigma);
         poly[i] = z.clamp(-4, 4) as i8;
     }
 
@@ -202,6 +222,36 @@ fn is_invertible(f: &[i8], n: usize) -> bool {
     for c in &f_ntt {
         if c.is_zero() {
             return false;
+        }
+    }
+
+    true
+}
+
+/// Checks if the LDL* tree has acceptable quality for FALCON signing.
+///
+/// Per FIPS 206, the Gram-Schmidt norms at all tree leaves must satisfy:
+///
+///   tree_sigma <= sigma_sign / sigma_min
+///
+/// This ensures that `sigma_eff = sigma_sign / tree_sigma >= sigma_min`
+/// at every leaf. Used only in diagnostic tests — the main keygen relies
+/// on the signing loop's norm check as the safety net (matching the
+/// Falcon reference implementation).
+#[cfg(test)]
+fn check_tree_quality(gs: &GramSchmidt, params: &Params) -> bool {
+    let tree = &gs.tree;
+    let max_tree_sigma = params.sigma / params.sigma_min;
+
+    let leaf_level = tree.depth - 1;
+    let n_leaves = tree.nodes_at_level(leaf_level);
+
+    for pos in 0..n_leaves {
+        let node = tree.get_node(leaf_level, pos);
+        for &s in &node.sigma {
+            if s > max_tree_sigma {
+                return false;
+            }
         }
     }
 
@@ -320,7 +370,14 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
             Err(_) => continue,
         };
 
-        // Compute the Gram-Schmidt basis
+        // Compute the Gram-Schmidt basis for the LDL* tree.
+        // Note: The Falcon reference implementation does NOT perform an
+        // explicit tree quality check. Instead, the sampler clamps
+        // sigma_eff = max(sigma_min, sigma_sign/tree_sigma) at each leaf,
+        // and the signature norm check in the signing loop rejects any
+        // signatures that are too large. This matches the reference behavior
+        // and avoids rejecting keys where a few leaves are slightly above
+        // the ideal threshold.
         let gs = compute_gram_schmidt(&f, &g, &big_f, &big_g);
 
         // Success!
@@ -446,6 +503,7 @@ mod tests {
             pk_bytes: 64,
             sk_bytes: 128,
             sig_bytes_max: 64,
+            rice_k: 8,
             security_level: 1,
         };
 
@@ -554,19 +612,76 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_keygen_512() {
         let mut rng = StdRng::seed_from_u64(42);
-        let result = keygen_512(&mut rng);
+        let keypair = keygen_512(&mut rng).expect("FALCON-512 keygen must succeed");
 
-        match result {
-            Ok(keypair) => {
-                assert_eq!(keypair.pk.h.len(), 512);
-                assert_eq!(keypair.sk.f.len(), 512);
-            }
-            Err(e) => {
-                println!("Keygen failed (expected for incomplete impl): {}", e);
-            }
-        }
+        assert_eq!(keypair.pk.h.len(), 512);
+        assert_eq!(keypair.sk.f.len(), 512);
+        assert_eq!(keypair.sk.g.len(), 512);
+        assert_eq!(keypair.sk.big_f.len(), 512);
+        assert_eq!(keypair.sk.big_g.len(), 512);
+    }
+
+    /// Verifies that keygen with correct Gaussian sampling produces keys
+    /// with reasonable tree quality (avg g00 close to expected).
+    #[test]
+    fn test_tree_leaf_sigma_diagnostic() {
+        use crate::params::FALCON_512;
+
+        let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let n = 512;
+                let sigma_gen = keygen_sigma(n);
+                let params = &FALCON_512;
+                let max_tree_sigma = params.sigma / params.sigma_min;
+                // Expected avg g00 = (||f_fft||² + ||g_fft||²) / n
+                // Since Parseval: ||f_fft||² = n*||f||², and ||f||² ≈ n*sigma²:
+                // avg g00 ≈ (n²*sigma² + n²*sigma²) / n = 2*n*sigma²
+                let expected_avg_g00 = 2.0 * (n as f64) * sigma_gen * sigma_gen;
+
+                let mut rng = StdRng::seed_from_u64(42);
+                for _attempt in 0..50u32 {
+                    let f = generate_small_poly(&mut rng, n, sigma_gen);
+                    let g = generate_small_poly(&mut rng, n, sigma_gen);
+
+                    if f[0] == 0 || !is_invertible(&f, n) { continue; }
+                    let (big_f, big_g) = match ntru_solve(&f, &g, n) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+
+                    let gs = compute_gram_schmidt(&f, &g, &big_f, &big_g);
+                    let f_norm_sq: f64 = gs.f_fft.iter().map(|c| c.norm_sq()).sum();
+                    let g_norm_sq: f64 = gs.g_fft.iter().map(|c| c.norm_sq()).sum();
+                    let avg_g00 = (f_norm_sq + g_norm_sq) / n as f64;
+
+                    // avg g00 should be within 30% of expected
+                    assert!(
+                        avg_g00 > expected_avg_g00 * 0.7 && avg_g00 < expected_avg_g00 * 1.3,
+                        "avg g00 = {:.1}, expected ≈ {:.1}, threshold² = {:.1}",
+                        avg_g00, expected_avg_g00, max_tree_sigma * max_tree_sigma
+                    );
+
+                    // Most leaves should be below threshold (< 20% above for well-formed keys)
+                    let tree = &gs.tree;
+                    let leaf_level = tree.depth - 1;
+                    let n_leaves = tree.nodes_at_level(leaf_level);
+                    let total_sigma_values = n_leaves * 2;
+                    let above: usize = (0..n_leaves)
+                        .flat_map(|pos| tree.get_node(leaf_level, pos).sigma.iter().copied())
+                        .filter(|&s| s > max_tree_sigma)
+                        .count();
+                    assert!(
+                        (above as f64) < 0.20 * (total_sigma_values as f64),
+                        "Too many leaves above threshold: {}/{}", above, total_sigma_values
+                    );
+                    return;
+                }
+                panic!("No valid key found in 50 attempts");
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 }

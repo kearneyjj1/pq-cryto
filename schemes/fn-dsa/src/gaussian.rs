@@ -28,33 +28,23 @@ const INV_2SIGMA0_SQ: f64 = 0.150_868_809_571_805_55;
 /// Values beyond this are essentially zero probability.
 const MAX_SIGMA_MULT: f64 = 10.0;
 
-/// CDT table precision: number of bits of precision.
-const CDT_BITS: usize = 72;
-
 // ============================================================================
-// Base Gaussian Sampler
+// Naive Gaussian Samplers (test-only)
 // ============================================================================
 
 /// Samples from a discrete Gaussian distribution N(0, sigma^2) over Z.
 ///
-/// Uses the cumulative distribution table (CDT) method for efficiency.
-/// Returns an integer z sampled according to exp(-z^2 / (2*sigma^2)).
+/// Uses rejection sampling. This is NOT constant-time and is only used
+/// as a fallback for toy test parameters where sigma < sigma_min.
+#[cfg(test)]
 pub fn sample_z_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
     if sigma <= 0.0 {
         return 0;
     }
 
-    // For small sigma, use rejection sampling
-    // For larger sigma, use the half-Gaussian CDT method
-
-    // Sample sign: +1 or -1
     let sign: i64 = if rng.gen_bool(0.5) { 1 } else { -1 };
-
-    // Sample |z| from the half-Gaussian
     let abs_z = sample_half_gaussian(rng, sigma);
 
-    // Handle z=0 specially: it should appear with probability 1/(1 + 2*sum)
-    // For now, use the sign convention
     if abs_z == 0 {
         0
     } else {
@@ -63,18 +53,13 @@ pub fn sample_z_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
 }
 
 /// Samples |z| from a half-Gaussian (z >= 0).
+#[cfg(test)]
 fn sample_half_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
-    // Use rejection sampling for the half-Gaussian
     let max_z = (sigma * MAX_SIGMA_MULT).ceil() as i64;
 
     loop {
-        // Sample uniformly from [0, max_z]
         let z = rng.gen_range(0..=max_z);
-
-        // Accept with probability proportional to exp(-z^2 / (2*sigma^2))
         let prob = (-((z * z) as f64) / (2.0 * sigma * sigma)).exp();
-
-        // Use a uniform random number to decide
         let u: f64 = rng.gen();
         if u < prob {
             return z;
@@ -84,27 +69,20 @@ fn sample_half_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
 
 /// Samples from a discrete Gaussian N(mu, sigma^2) centered at mu.
 ///
-/// This samples z such that the probability is proportional to exp(-(z-mu)^2 / (2*sigma^2)).
+/// Uses rejection sampling. NOT constant-time — only for test builds.
+#[cfg(test)]
 pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
     if sigma <= 0.0 {
         return mu.round() as i64;
     }
 
-    // Sample z from N(0, sigma^2), then shift by mu and round
-    // This is an approximation; proper FALCON uses a more sophisticated approach
-
-    // For FALCON, we use rejection sampling around mu
     let max_offset = (sigma * MAX_SIGMA_MULT).ceil() as i64;
     let mu_floor = mu.floor() as i64;
 
     loop {
-        // Sample uniformly around mu
         let z = mu_floor + rng.gen_range(-max_offset..=max_offset);
-
-        // Accept with probability proportional to exp(-(z-mu)^2 / (2*sigma^2))
         let diff = z as f64 - mu;
         let prob = (-(diff * diff) / (2.0 * sigma * sigma)).exp();
-
         let u: f64 = rng.gen();
         if u < prob {
             return z;
@@ -113,154 +91,159 @@ pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
 }
 
 // ============================================================================
-// Bernoullí Sampler
+// Keygen Gaussian Sampler
+// ============================================================================
+
+/// Samples from a discrete Gaussian N(0, sigma^2) for key generation.
+///
+/// Uses standard rejection sampling with uniform proposal over [-K*sigma, K*sigma].
+/// This is NOT constant-time, which is acceptable for keygen (one-time operation
+/// that doesn't process secret data — the secret IS the output).
+///
+/// The FIPS 206 SamplerZ (Algorithm 12) cannot be used for keygen because its
+/// base sampler at sigma_0=1.82 has lighter tails than the target sigma≈4.05,
+/// causing BerExp's acceptance probability to cap at 1.0 for large |z| and
+/// producing incorrect (too-low) variance.
+pub fn sample_keygen_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
+    if sigma <= 0.0 {
+        return 0;
+    }
+
+    let max_z = (sigma * MAX_SIGMA_MULT).ceil() as i64;
+    let two_sigma_sq = 2.0 * sigma * sigma;
+
+    loop {
+        // Uniform proposal over [-max_z, max_z]
+        let z = rng.gen_range(-max_z..=max_z);
+        // Accept with probability exp(-z^2 / (2*sigma^2))
+        let prob = (-((z * z) as f64) / two_sigma_sq).exp();
+        let u: f64 = rng.gen();
+        if u < prob {
+            return z;
+        }
+    }
+}
+
+// ============================================================================
+// Bernoulli Sampler (old floating-point version, test-only)
 // ============================================================================
 
 /// Samples a Bernoulli variable: returns true with probability exp(-x) for x >= 0.
+///
+/// Uses floating-point arithmetic. NOT constant-time — test builds only.
+#[cfg(test)]
 pub fn sample_bernoulli_exp<R: RngCore>(rng: &mut R, x: f64) -> bool {
     if x <= 0.0 {
         return true;
     }
     if x >= 1.0 {
-        // For x >= 1, recurse: P(accept) = exp(-x) = exp(-1) * exp(-(x-1))
-        // So accept if both exp(-1) and exp(-(x-1)) accept
         if !sample_bernoulli_exp_minus_one(rng) {
             return false;
         }
         return sample_bernoulli_exp(rng, x - 1.0);
     }
-
-    // For 0 < x < 1, use direct comparison
-    // This is simpler and more reliable for the use case
     let prob = (-x).exp();
     rng.gen::<f64>() < prob
 }
 
-/// Samples Bernoulli with probability exp(-1) ≈ 0.368.
+/// Samples Bernoulli with probability exp(-1) ≈ 0.368 (test-only).
+#[cfg(test)]
 fn sample_bernoulli_exp_minus_one<R: RngCore>(rng: &mut R) -> bool {
-    // exp(-1) ≈ 0.36787944117144233
-    // Use a precomputed table or direct comparison
     const EXP_MINUS_1: f64 = 0.36787944117144233;
     rng.gen::<f64>() < EXP_MINUS_1
 }
 
-/// Samples Bernoulli with probability cosh(x)^(-1) for computing rejection.
-fn sample_bernoulli_cosh<R: RngCore>(rng: &mut R, x: f64) -> bool {
-    // P(accept) = 1/cosh(x) = 2/(e^x + e^(-x))
-    let prob = 1.0 / x.cosh();
-    rng.gen::<f64>() < prob
-}
-
 // ============================================================================
-// BaseSampler for FALCON
+// FIPS 206 RCDT Table and BaseSampler
 // ============================================================================
 
-/// The base sampler for FALCON's signature scheme.
+/// FIPS 206 RCDT (Reverse Cumulative Distribution Table) for the half-Gaussian
+/// at sigma_0 = 1.8205.
 ///
-/// This samples from a discrete Gaussian with standard deviation sigma_min = 1.277833,
-/// which is the minimum Gaussian width used in the FALCON sampler.
-pub struct BaseSampler {
-    /// Precomputed CDT for the base Gaussian.
-    cdt: Vec<u64>,
-    /// Sigma for the base sampler.
-    sigma: f64,
-}
+/// 18 entries, each stored as 3 × 24-bit limbs `[w2, w1, w0]`.
+/// Full 72-bit value = `w2 * 2^48 + w1 * 2^24 + w0`.
+/// Entry `i` represents `floor(2^72 * P(|z| >= i+1))`.
+///
+/// From the Falcon reference implementation (`sign.c` `dist[]` array).
+const RCDT: [[u32; 3]; 18] = [
+    [10745844, 3068844, 3741698],
+    [5559083, 1580863, 8248194],
+    [2260429, 13669192, 2736639],
+    [708981, 4421575, 10046180],
+    [169348, 7122675, 4136815],
+    [30538, 13063405, 7650655],
+    [4132, 14505003, 7826148],
+    [417, 16768101, 11363290],
+    [31, 8444042, 8086568],
+    [1, 12844466, 265321],
+    [0, 1232676, 13644283],
+    [0, 38047, 9111839],
+    [0, 870, 6138264],
+    [0, 14, 12545723],
+    [0, 0, 3104126],
+    [0, 0, 28824],
+    [0, 0, 198],
+    [0, 0, 1],
+];
+
+/// The base sampler for FALCON's signature scheme (FIPS 206).
+///
+/// Samples from the half-Gaussian distribution at `sigma_0 = 1.8205`
+/// using the RCDT method with 72-bit precision. The comparison is
+/// constant-time using multi-limb subtraction with borrow propagation.
+pub struct BaseSampler;
 
 impl BaseSampler {
-    /// Creates a new base sampler at sigma_0 = 1.8205 (FIPS 206).
+    /// Creates a new base sampler.
     pub fn new() -> Self {
-        let sigma = SIGMA_0;
-        let cdt = Self::compute_cdt(sigma);
-        BaseSampler { cdt, sigma }
+        BaseSampler
     }
 
-    /// Creates a base sampler with a custom sigma.
-    pub fn with_sigma(sigma: f64) -> Self {
-        let cdt = Self::compute_cdt(sigma);
-        BaseSampler { cdt, sigma }
-    }
-
-    /// Computes the CDT for a given sigma.
-    fn compute_cdt(sigma: f64) -> Vec<u64> {
-        // CDT[i] = floor(2^63 * sum_{j=0}^{i} P(z=j))
-        // where P(z=j) = exp(-j^2 / (2*sigma^2)) / Z
-        // and Z = sum_{j=-inf}^{inf} exp(-j^2 / (2*sigma^2))
-
-        // First compute the normalizing constant (for half-Gaussian)
-        let max_z = (sigma * MAX_SIGMA_MULT).ceil() as usize;
-        let mut probs = Vec::with_capacity(max_z + 1);
-
-        for z in 0..=max_z {
-            let zf = z as f64;
-            probs.push((-(zf * zf) / (2.0 * sigma * sigma)).exp());
-        }
-
-        // Normalize (for half-Gaussian, z=0 has weight 1, z>0 has weight 2)
-        let z: f64 = probs[0] + 2.0 * probs[1..].iter().sum::<f64>();
-
-        // Build CDT
-        let mut cdt = Vec::with_capacity(max_z + 1);
-        let mut cumsum = 0.0;
-        let scale = (1u64 << 63) as f64;
-
-        for (i, &p) in probs.iter().enumerate() {
-            let weight = if i == 0 { 1.0 } else { 2.0 };
-            cumsum += weight * p / z;
-            cdt.push((cumsum * scale) as u64);
-        }
-
-        cdt
-    }
-
-    /// Samples from the base discrete Gaussian.
+    /// Samples from the full discrete Gaussian at sigma_0.
     ///
-    /// # Security
-    ///
-    /// This uses a constant-time linear scan through the CDT table,
-    /// avoiding data-dependent branches that could leak information.
-    /// All comparisons use arithmetic masking instead of conditional branches.
+    /// Returns a signed integer `z` with `P(z) ∝ exp(-z²/(2σ₀²))`.
+    /// Uses 72-bit precision RCDT with constant-time comparison.
     pub fn sample<R: RngCore>(&self, rng: &mut R) -> i64 {
-        // Sample from the half-Gaussian using CDT
-        let u: u64 = rng.gen();
-        let half_u = u >> 1; // Use top 63 bits
+        let z = self.sample_half(rng);
 
-        // Constant-time linear scan through CDT
-        // Count how many thresholds half_u exceeds
-        let mut abs_z: i64 = 0;
-        for &threshold in &self.cdt {
-            // Constant-time comparison: (half_u >= threshold) without branching
-            // If half_u >= threshold, then (half_u.wrapping_sub(threshold)) has high bit 0
-            // If half_u < threshold, then wrapping_sub produces a large number with high bit 1
-            let diff = half_u.wrapping_sub(threshold);
-            let exceeded = ((!(diff >> 63)) & 1) as i64; // 1 if half_u >= threshold, 0 otherwise
-            abs_z += exceeded;
-        }
+        // Random sign bit (constant-time)
+        let mut sign_byte = [0u8; 1];
+        rng.fill_bytes(&mut sign_byte);
+        let b = (sign_byte[0] & 1) as i64;
+        let sign = 1 - 2 * b; // +1 or -1
 
-        // Sample sign using the LSB of u (constant-time)
-        let sign_bit = (u & 1) as i64;
-        let sign = 1 - 2 * sign_bit; // 1 if bit=0, -1 if bit=1
-
-        // Apply sign, but return 0 if abs_z == 0
-        // Use constant-time selection: result = sign * abs_z (which is 0 when abs_z is 0)
-        sign * abs_z
+        // z=0 * any sign = 0, which is correct
+        sign * z
     }
 
-    /// Samples z0 >= 0 from the half-Gaussian at sigma_0.
+    /// Samples `z0 >= 0` from the half-Gaussian at `sigma_0 = 1.8205`.
     ///
-    /// This is used as the proposal distribution in the FIPS 206 SamplerZ.
+    /// Draws 9 random bytes (72 bits), splits into 3 × 24-bit limbs,
+    /// and performs a constant-time scan against the RCDT table.
+    /// The result `z0` counts how many RCDT entries exceed the random value.
     pub fn sample_half<R: RngCore>(&self, rng: &mut R) -> i64 {
-        let u: u64 = rng.gen();
-        let half_u = u >> 1; // 63-bit precision for CDT
+        // Draw 72 random bits
+        let mut bytes = [0u8; 9];
+        rng.fill_bytes(&mut bytes);
 
-        // Constant-time linear scan through CDT
-        let mut z0: i64 = 0;
-        for &threshold in &self.cdt {
-            let diff = half_u.wrapping_sub(threshold);
-            let exceeded = ((!(diff >> 63)) & 1) as i64;
-            z0 += exceeded;
+        // Split into 3 × 24-bit limbs (little-endian byte order)
+        let v0 = (bytes[0] as u32) | ((bytes[1] as u32) << 8) | ((bytes[2] as u32) << 16);
+        let v1 = (bytes[3] as u32) | ((bytes[4] as u32) << 8) | ((bytes[5] as u32) << 16);
+        let v2 = (bytes[6] as u32) | ((bytes[7] as u32) << 8) | ((bytes[8] as u32) << 16);
+
+        // Constant-time scan: count RCDT entries where (v2,v1,v0) < (w2,w1,w0).
+        // Multi-limb subtraction: borrow propagates through bit 31 of each u32.
+        let mut z: i64 = 0;
+        for entry in &RCDT {
+            let w2 = entry[0];
+            let w1 = entry[1];
+            let w0 = entry[2];
+            let cc0 = (v0.wrapping_sub(w0)) >> 31;
+            let cc1 = (v1.wrapping_sub(w1).wrapping_sub(cc0)) >> 31;
+            let cc2 = (v2.wrapping_sub(w2).wrapping_sub(cc1)) >> 31;
+            z += cc2 as i64;
         }
-
-        z0
+        z
     }
 }
 
@@ -271,25 +254,150 @@ impl Default for BaseSampler {
 }
 
 // ============================================================================
-// BerExp: Bernoulli exponential acceptance test
+// Constant-time BerExp: Bernoulli exponential acceptance test
 // ============================================================================
 
-/// Accepts with probability ccs * exp(-x).
+/// Q63 fixed-point coefficients for the exp(-x) Taylor polynomial.
+/// `C[k] = floor(2^63 / k!)` for k = 0..12.
+/// Used by the integer-only `fpr_expm_p63` implementation.
+const EXP_COEFFS: [u64; 13] = [
+    0x8000000000000000,  // C[ 0] = floor(2^63 / 0!)  = 9223372036854775808
+    0x8000000000000000,  // C[ 1] = floor(2^63 / 1!)  = 9223372036854775808
+    0x4000000000000000,  // C[ 2] = floor(2^63 / 2!)  = 4611686018427387904
+    0x1555555555555555,  // C[ 3] = floor(2^63 / 3!)  = 1537228672809129301
+    0x0555555555555555,  // C[ 4] = floor(2^63 / 4!)  = 384307168202282325
+    0x0111111111111111,  // C[ 5] = floor(2^63 / 5!)  = 76861433640456465
+    0x002D82D82D82D82D,  // C[ 6] = floor(2^63 / 6!)  = 12810238940076077
+    0x0006806806806806,  // C[ 7] = floor(2^63 / 7!)  = 1830034134296582
+    0x0000D00D00D00D00,  // C[ 8] = floor(2^63 / 8!)  = 228754266787072
+    0x0000171DE3A556C7,  // C[ 9] = floor(2^63 / 9!)  = 25417140754119
+    0x0000024FC9F6EF13,  // C[10] = floor(2^63 / 10!) = 2541714075411
+    0x00000035CC8ACFEA,  // C[11] = floor(2^63 / 11!) = 231064915946
+    0x000000047BB63BFE,  // C[12] = floor(2^63 / 12!) = 19255409662
+];
+
+/// Computes `(a * b) >> 63` using 128-bit intermediate arithmetic.
+/// Both `a` and `b` are Q63 fixed-point values.
+#[inline]
+fn mulhi63(a: u64, b: u64) -> u64 {
+    ((a as u128 * b as u128) >> 63) as u64
+}
+
+/// Computes `floor(2^63 * ccs * exp(-x))` for `0 <= x < ln(2)`.
 ///
-/// For x >= 0: tests Bernoulli(exp(-x)) AND Bernoulli(ccs) independently.
-/// For x < 0: exp(-x) > 1, so computes the product directly and caps at 1.
+/// Uses pure integer fixed-point arithmetic (Q63 format) for the polynomial
+/// evaluation, eliminating all floating-point operations in the inner loop.
+/// Only two f64-to-integer conversions occur at the boundary (x and ccs).
+///
+/// The polynomial is a degree-12 Taylor approximation of exp(-x),
+/// evaluated via Horner's method in Q63 fixed-point:
+///   y = C[12]
+///   y = C[k] - (x_q63 * y) >> 63   for k = 11 down to 0
+///
+/// Based on the Falcon reference implementation's `fpr_expm_p63` in `sign.c`.
+fn fpr_expm_p63(x: f64, ccs: f64) -> u64 {
+    // Convert x to Q63 fixed-point: x is in [0, ln(2)) ≈ [0, 0.693)
+    // so x * 2^63 < 2^63, safe for u64.
+    let x_q63 = (x * 9_223_372_036_854_775_808.0) as u64;
+
+    // Convert ccs to Q63 fixed-point: ccs is in (0, 1] so ccs * 2^63 fits in u64.
+    let ccs_q63 = (ccs * 9_223_372_036_854_775_808.0) as u64;
+
+    // Horner evaluation in Q63 fixed-point, from highest to lowest coefficient.
+    let mut y = EXP_COEFFS[12];
+    y = EXP_COEFFS[11].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[10].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[9].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[8].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[7].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[6].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[5].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[4].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[3].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[2].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[1].wrapping_sub(mulhi63(x_q63, y));
+    y = EXP_COEFFS[0].wrapping_sub(mulhi63(x_q63, y));
+
+    // Final: multiply exp(-x) result by ccs (also in Q63)
+    mulhi63(y, ccs_q63)
+}
+
+/// Original floating-point fpr_expm_p63, retained for comparison testing.
+#[cfg(test)]
+fn fpr_expm_p63_float(x: f64, ccs: f64) -> u64 {
+    let mut y: f64 = 1.0 / 479_001_600.0;
+    y = 1.0 / 39_916_800.0 - x * y;
+    y = 1.0 / 3_628_800.0 - x * y;
+    y = 1.0 / 362_880.0 - x * y;
+    y = 1.0 / 40_320.0 - x * y;
+    y = 1.0 / 5_040.0 - x * y;
+    y = 1.0 / 720.0 - x * y;
+    y = 1.0 / 120.0 - x * y;
+    y = 1.0 / 24.0 - x * y;
+    y = (1.0 / 6.0) - x * y;
+    y = 0.5 - x * y;
+    y = 1.0 - x * y;
+    y = 1.0 - x * y;
+    let z = y * ccs * 9_223_372_036_854_775_808.0;
+    z as u64
+}
+
+/// Accepts with probability `ccs * exp(-x)` using constant-time control flow.
+///
+/// Implements the Falcon reference BerExp algorithm:
+/// 1. Decompose `x = s * ln(2) + r` where `0 <= r < ln(2)` (for x >= 0)
+/// 2. Compute `z = floor(2^63 * ccs * exp(-r))` via integer polynomial
+/// 3. Halve `z` exactly `s` times: `z = (z + 1) >> 1` per step (constant-time)
+/// 4. Accept if a random 63-bit value is less than `z`
+///
+/// For x < 0 (which can occur when sigma slightly exceeds sigma_0 during
+/// signing), the probability `ccs * exp(-x) = ccs * exp(|x|)` is computed
+/// using floating-point. This is acceptable because: (a) the negative-x
+/// case is uncommon and the probability is high (near 1.0), (b) precision
+/// differences in this regime don't affect security, and (c) the
+/// security-critical x >= 0 path uses pure integer arithmetic.
 fn ber_exp<R: RngCore>(rng: &mut R, x: f64, ccs: f64) -> bool {
+    const LN2: f64 = 0.693_147_180_559_945_309_417_232_121_458;
+    const INV_LN2: f64 = 1.442_695_040_888_963_407_359_924_681_002;
+
+    // Handle negative x separately: the integer fpr_expm_p63 only works for
+    // non-negative x (Q63 fixed-point can't represent negative values).
     if x < 0.0 {
-        // exp(-x) > 1; compute P = min(1, ccs * exp(-x)) directly
-        let p = (ccs * (-x).exp()).min(1.0);
-        return rng.gen::<f64>() < p;
+        // prob = ccs * exp(|x|). If >= 1, always accept.
+        let prob = ccs * (-x).exp();
+        if prob >= 1.0 {
+            // Still consume the random value for constant RNG consumption
+            let _w: u64 = rng.gen();
+            return true;
+        }
+        // prob < 1: compute z = floor(prob * 2^63) and compare
+        let z = (prob * 9_223_372_036_854_775_808.0) as u64;
+        let w: u64 = rng.gen::<u64>() >> 1;
+        return w < z;
     }
 
-    // x >= 0: P = ccs * exp(-x). Test each factor independently.
-    if !sample_bernoulli_exp(rng, x) {
-        return false;
+    // Standard path (x >= 0): pure integer arithmetic
+    let s = (x * INV_LN2).floor() as u32;
+    let r = x - (s as f64) * LN2;
+
+    // Compute z = floor(2^63 * ccs * exp(-r)) using integer polynomial
+    let mut z = fpr_expm_p63(r, ccs);
+
+    // Halve z exactly s times, constant-time over 63 iterations.
+    // Each halving computes z = (z + 1) >> 1.
+    // Masking ensures only the first s iterations actually modify z.
+    // For s = 0 (including negative-x case): no halvings, z unchanged.
+    for i in 0..63u32 {
+        // is_active = 1 if i < s, 0 otherwise (constant-time)
+        let is_active = ((i.wrapping_sub(s)) >> 31) & 1;
+        let mask = (is_active as u64).wrapping_neg(); // all-1s or all-0s
+        let halved = (z + 1) >> 1;
+        z ^= (z ^ halved) & mask;
     }
-    rng.gen::<f64>() < ccs
+
+    // Draw random 63-bit value and compare
+    let w: u64 = rng.gen::<u64>() >> 1;
+    w < z
 }
 
 // ============================================================================
@@ -327,14 +435,24 @@ impl SamplerZ {
 
     /// Samples z from the discrete Gaussian N(mu, sigma^2) per FIPS 206 Algorithm 12.
     ///
-    /// For sigma >= sigma_min, uses the FIPS 206 algorithm. For sigma < sigma_min
-    /// (which can occur with toy test parameters), falls back to simple rejection
-    /// sampling.
+    /// Requires `sigma >= sigma_min`. In test builds, falls back to naive rejection
+    /// sampling for toy parameters where sigma < sigma_min. In release builds,
+    /// sigma is clamped to sigma_min with a debug_assert.
     pub fn sample<R: RngCore>(&self, rng: &mut R, mu: f64, sigma: f64) -> i64 {
-        // Fallback for sigma below sigma_min (toy parameters with poorly conditioned basis)
+        // Guard: sigma must be >= sigma_min for FIPS 206 correctness
+        #[cfg(test)]
         if sigma < self.sigma_min {
             return sample_gaussian(rng, mu, sigma.max(0.01));
         }
+        #[cfg(not(test))]
+        let sigma = {
+            debug_assert!(
+                sigma >= self.sigma_min,
+                "SamplerZ requires sigma ({}) >= sigma_min ({})",
+                sigma, self.sigma_min
+            );
+            sigma.max(self.sigma_min)
+        };
 
         let s = mu.floor() as i64;
         let r = mu - (s as f64);
@@ -345,26 +463,32 @@ impl SamplerZ {
             // 1. Sample z0 >= 0 from half-Gaussian at sigma_0
             let z0 = self.base.sample_half(rng);
 
-            // 2. Random sign bit
-            let b: i64 = if rng.gen_bool(0.5) { 1 } else { 0 };
+            // 2. Random sign bit (constant-time: avoid gen_bool which uses f64)
+            let mut sign_byte = [0u8; 1];
+            rng.fill_bytes(&mut sign_byte);
+            let b: i64 = (sign_byte[0] & 1) as i64;
 
             // 3. z = b + (2b - 1) * z0
             //    b=1 → z = 1 + z0 (positive side)
             //    b=0 → z = -z0    (negative side)
             let z = b + (2 * b - 1) * z0;
 
-            // 4. Reject (z=0, b=0) to avoid double-counting zero
-            if z == 0 && b == 0 {
-                continue;
-            }
-
-            // 5. Compute exponent for rejection test
+            // 4. Compute exponent for rejection test
             //    x = (z - r)^2 / (2*sigma^2) - z0^2 / (2*sigma_0^2)
             let zr = (z as f64) - r;
             let x = zr * zr * dss - (z0 as f64) * (z0 as f64) * INV_2SIGMA0_SQ;
 
-            // 6. Accept with probability ccs * exp(-x)
-            if ber_exp(rng, x, ccs) {
+            // 5. BerExp acceptance test
+            let accept_ber = ber_exp(rng, x, ccs);
+
+            // 6. Constant-time rejection of (z=0, b=0) case.
+            // z_nonzero_or_b: is 1 if z != 0 OR b != 0, i.e. the sample is valid.
+            // For z as i64: z != 0 iff (z | z.wrapping_neg()) has bit 63 set.
+            let z_nonzero = ((z as u64) | (z as u64).wrapping_neg()) >> 63;
+            let valid = z_nonzero | (b as u64);
+
+            // Accept iff BerExp accepted AND (z,b) is not the forbidden (0,0) case
+            if accept_ber && valid != 0 {
                 return s + z;
             }
         }
@@ -557,6 +681,112 @@ mod tests {
             "Rate {} should be close to {}",
             rate,
             expected
+        );
+    }
+
+    #[test]
+    fn test_ber_exp_negative_x() {
+        // Verify ber_exp handles negative x correctly (ccs * exp(-x) < 1).
+        // This is critical for SamplerZ when sigma > sigma_0 (keygen case).
+        let mut rng = StdRng::seed_from_u64(222);
+        let ccs: f64 = SIGMA_MIN / 4.05; // ≈ 0.315
+
+        // For x = -0.5, correct probability = ccs * exp(0.5) ≈ 0.519
+        let mut count = 0;
+        let n = 20000;
+        for _ in 0..n {
+            if ber_exp(&mut rng, -0.5, ccs) {
+                count += 1;
+            }
+        }
+        let rate = (count as f64) / (n as f64);
+        let expected = ccs * (0.5f64).exp();
+        assert!(
+            (rate - expected).abs() < 0.03,
+            "BerExp(-0.5, {}): rate {} should be close to {}",
+            ccs, rate, expected
+        );
+
+        // For x = -0.03, correct probability = ccs * exp(0.03) ≈ 0.325
+        let mut count2 = 0;
+        for _ in 0..n {
+            if ber_exp(&mut rng, -0.03, ccs) {
+                count2 += 1;
+            }
+        }
+        let rate2 = (count2 as f64) / (n as f64);
+        let expected2 = ccs * (0.03f64).exp();
+        assert!(
+            (rate2 - expected2).abs() < 0.03,
+            "BerExp(-0.03, {}): rate {} should be close to {}",
+            ccs, rate2, expected2
+        );
+    }
+
+    #[test]
+    fn test_fpr_expm_p63_integer_vs_float() {
+        // Compare integer and floating-point implementations across [0, ln(2))
+        let ccs_values = [1.0, 0.5, 0.315, 0.999, 0.01];
+        for &ccs in &ccs_values {
+            for i in 0..500 {
+                let x = (i as f64) * 0.693 / 500.0;
+                let int_result = fpr_expm_p63(x, ccs);
+                let float_result = fpr_expm_p63_float(x, ccs);
+                let diff = (int_result as i128 - float_result as i128).unsigned_abs();
+                assert!(
+                    diff <= 2048, // Allow small rounding differences from Q63 truncation
+                    "Mismatch at x={:.6}, ccs={}: int={}, float={}, diff={}",
+                    x, ccs, int_result, float_result, diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fpr_expm_p63_boundary_values() {
+        // x = 0: exp(0) = 1, result should be ccs * 2^63
+        let r = fpr_expm_p63(0.0, 1.0);
+        assert!(r > 0x7FFFFFFFFF000000u64, "exp(0)*1.0*2^63 should be near 2^63, got {}", r);
+
+        // x near ln(2): exp(-0.693) ≈ 0.50028, result should be near that * 2^63
+        let r2 = fpr_expm_p63(0.693, 1.0);
+        let expected = ((-0.693f64).exp() * 9_223_372_036_854_775_808.0) as u64;
+        let diff = (r2 as i128 - expected as i128).unsigned_abs();
+        assert!(diff < 1_000_000_000, "exp(-0.693) result too far from expected, diff={}", diff);
+    }
+
+    #[test]
+    fn test_keygen_gaussian_variance() {
+        // Verify sample_keygen_gaussian produces correct variance for sigma=4.05
+        // (keygen sigma for FALCON-512).
+        let mut rng = StdRng::seed_from_u64(42);
+        let sigma = 4.05;
+
+        let mut sum: i64 = 0;
+        let mut sum_sq: i64 = 0;
+        let n = 10000;
+
+        for _ in 0..n {
+            let z = sample_keygen_gaussian(&mut rng, sigma);
+            sum += z;
+            sum_sq += z * z;
+        }
+
+        let mean = (sum as f64) / (n as f64);
+        let variance = (sum_sq as f64) / (n as f64) - mean * mean;
+        let expected_var = sigma * sigma; // 16.4
+
+        assert!(
+            mean.abs() < 0.5,
+            "Mean {} should be close to 0",
+            mean
+        );
+
+        // Variance should be within 15% of sigma^2
+        assert!(
+            variance > expected_var * 0.85 && variance < expected_var * 1.15,
+            "Variance {} should be close to {} (sigma={})",
+            variance, expected_var, sigma
         );
     }
 }

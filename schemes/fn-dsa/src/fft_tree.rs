@@ -6,8 +6,13 @@
 //!
 //! The tree has log2(n) + 1 levels, where each level stores the
 //! Gram-Schmidt data for that recursion level.
+//!
+//! The tree construction follows FIPS 206 Algorithm 9 (ffLDL) and
+//! matches the reference implementation (tprest/falcon.py, `ffldl_fft`
+//! in `ffsampling.py`).
 
 use crate::fft::{split_fft, Complex};
+use zeroize::Zeroize;
 
 /// A node in the FFT tree storing LDL* decomposition data.
 #[derive(Clone, Debug)]
@@ -91,6 +96,16 @@ impl FftTree {
         1 << level
     }
 
+    /// Zeroizes all secret-dependent data in the tree nodes.
+    ///
+    /// Should be called when the tree is no longer needed (e.g. in SecretKey::Drop).
+    pub fn zeroize_tree(&mut self) {
+        for node in &mut self.nodes {
+            node.sigma.zeroize();
+            node.l10.zeroize();
+        }
+    }
+
     /// Builds the FFT tree from the secret key polynomials using ffLDL*.
     ///
     /// Given (f, g, F, G) in FFT form, computes the initial Gram matrix and
@@ -104,11 +119,16 @@ impl FftTree {
         let n = f_fft.len();
         let mut tree = FftTree::new(n);
 
-        // Compute the initial Gram matrix G = B * adj(B)
-        // where B = [[f, g], [F, G]] in FFT form.
-        // g00[i] = |f[i]|^2 + |g[i]|^2  (real)
-        // g01[i] = f[i]*conj(F[i]) + g[i]*conj(G[i])  (complex)
-        // g11[i] = |F[i]|^2 + |G[i]|^2  (real)
+        // Compute the initial Gram matrix G = B · B* (Hermitian)
+        // where B = [[g, -f], [G, -F]] in FFT form.
+        //
+        // g00[i] = |g[i]|^2 + |-f[i]|^2 = |f[i]|^2 + |g[i]|^2  (real)
+        // g01[i] = g[i]*conj(G[i]) + (-f[i])*conj(-F[i])
+        //        = g[i]*conj(G[i]) + f[i]*conj(F[i])             (complex)
+        // g11[i] = |G[i]|^2 + |-F[i]|^2 = |F[i]|^2 + |G[i]|^2  (real)
+        //
+        // Note: The Gram matrix entries are identical regardless of sign
+        // convention since |x|^2 = |-x|^2 and the cross terms cancel.
         let g00: Vec<f64> = (0..n)
             .map(|i| f_fft[i].norm_sq() + g_fft[i].norm_sq())
             .collect();
@@ -201,11 +221,12 @@ impl FftTree {
 
 /// Gram-Schmidt data for the full basis.
 ///
-/// Stores the Gram-Schmidt orthogonalization of [[f, g], [F, G]]
-/// in a form suitable for sampling.
+/// Stores the Gram-Schmidt orthogonalization of the NTRU secret basis
+/// `B = [[g, -f], [G, -F]]` (row-vector convention, `fG - gF = q`)
+/// in a form suitable for FFT-domain sampling.
 #[derive(Clone, Debug)]
 pub struct GramSchmidt {
-    /// The [[f, g], [F, G]] basis in FFT form.
+    /// The [[g, -f], [G, -F]] basis polynomials in FFT form.
     pub f_fft: Vec<Complex>,
     pub g_fft: Vec<Complex>,
     pub big_f_fft: Vec<Complex>,

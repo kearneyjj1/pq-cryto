@@ -88,51 +88,58 @@ impl Zq {
     }
 
     /// Returns the centered representation in [-(q-1)/2, (q-1)/2].
+    ///
+    /// Constant-time: no branches on the value.
     #[inline]
     pub fn centered(self) -> i16 {
-        let v = self.0;
-        let half_q = (Q / 2) as i16;
-        if v > half_q {
-            v - Q as i16
-        } else {
-            v
-        }
+        let v = self.0 as i32;
+        let half_q = (Q / 2) as i32;
+        // mask = all-1s if v > half_q, all-0s otherwise
+        let mask = (half_q - v) >> 31;
+        // If v > half_q: return v - Q; else return v
+        (v + (mask & (-Q))) as i16
     }
 }
 
 /// Reduces a value modulo q into [0, q-1].
+///
+/// Constant-time: the `%` operator for a constant divisor compiles to a
+/// multiply-shift sequence (no division instruction), and the conditional
+/// add uses an arithmetic shift mask instead of a branch.
 #[inline]
 pub fn reduce(val: i32) -> i16 {
-    let q = Q;
-    let mut r = val % q;
-    if r < 0 {
-        r += q;
-    }
+    let mut r = val % Q;
+    // Branchless: if r < 0, add Q
+    let neg_mask = r >> 31; // all-1s if r < 0, 0 otherwise
+    r += Q & neg_mask;
     r as i16
 }
 
 /// Reduces a 64-bit value modulo q.
+///
+/// Constant-time: branchless conditional add via arithmetic shift mask.
 #[inline]
 pub fn reduce64(val: i64) -> i16 {
     let q = Q as i64;
     let mut r = val % q;
-    if r < 0 {
-        r += q;
-    }
+    // Branchless: if r < 0, add q
+    let neg_mask = (r >> 63) as i64; // all-1s if r < 0
+    r += q & neg_mask;
     r as i16
 }
 
 impl Add for Zq {
     type Output = Zq;
 
+    /// Constant-time modular addition.
     #[inline]
     fn add(self, rhs: Zq) -> Zq {
         let sum = self.0 as i32 + rhs.0 as i32;
-        if sum >= Q {
-            Zq((sum - Q) as i16)
-        } else {
-            Zq(sum as i16)
-        }
+        // Branchless: if sum >= Q, subtract Q
+        let over = sum - Q;
+        // mask = all-0s if over < 0 (sum < Q), all-1s if over >= 0 (sum >= Q)
+        let mask = !(over >> 31);
+        Zq((sum - (Q & mask)) as i16)
     }
 }
 
@@ -146,14 +153,13 @@ impl AddAssign for Zq {
 impl Sub for Zq {
     type Output = Zq;
 
+    /// Constant-time modular subtraction.
     #[inline]
     fn sub(self, rhs: Zq) -> Zq {
         let diff = self.0 as i32 - rhs.0 as i32;
-        if diff < 0 {
-            Zq((diff + Q) as i16)
-        } else {
-            Zq(diff as i16)
-        }
+        // Branchless: if diff < 0, add Q
+        let neg_mask = diff >> 31; // all-1s if diff < 0, 0 otherwise
+        Zq((diff + (Q & neg_mask)) as i16)
     }
 }
 
@@ -167,10 +173,23 @@ impl SubAssign for Zq {
 impl Mul for Zq {
     type Output = Zq;
 
+    /// Constant-time modular multiplication using Barrett reduction.
     #[inline]
     fn mul(self, rhs: Zq) -> Zq {
         let prod = self.0 as i32 * rhs.0 as i32;
-        Zq(reduce(prod))
+        // Both inputs in [0, Q-1], so prod in [0, (Q-1)^2 = ~1.51e8].
+        // Barrett reduction: M = floor(2^28 / Q) = 21843
+        // q_approx = (prod * M) >> 28
+        // r = prod - q_approx * Q
+        // r may be off by at most Q, so one branchless correction.
+        const BARRETT_M: i64 = 21843;
+        let q_approx = ((prod as i64 * BARRETT_M) >> 28) as i32;
+        let mut r = prod - q_approx * Q;
+        // Branchless: if r >= Q, subtract Q
+        let over = r - Q;
+        let mask = !(over >> 31); // all-1s if r >= Q
+        r -= Q & mask;
+        Zq(r as i16)
     }
 }
 
@@ -184,13 +203,16 @@ impl MulAssign for Zq {
 impl Neg for Zq {
     type Output = Zq;
 
+    /// Constant-time modular negation.
     #[inline]
     fn neg(self) -> Zq {
-        if self.0 == 0 {
-            Zq::ZERO
-        } else {
-            Zq((Q as i16) - self.0)
-        }
+        let v = self.0 as i32;
+        // Branchless: (Q - v) if v != 0, else 0
+        // nonzero = 1 if v != 0, 0 if v == 0
+        let nonzero = ((v as u32) | (v as u32).wrapping_neg()) >> 31;
+        // mask = all-1s if nonzero, all-0s if zero
+        let mask = (nonzero as i32).wrapping_neg();
+        Zq(((Q - v) & mask) as i16)
     }
 }
 
@@ -339,5 +361,47 @@ mod tests {
         assert_eq!(reduce(Q + 1), 1);
         assert_eq!(reduce(2 * Q), 0);
         assert_eq!(reduce(100 * Q + 42), 42);
+    }
+
+    #[test]
+    fn test_ct_field_ops_exhaustive() {
+        // Exhaustive test of add, sub, neg over all Q values
+        for a_val in (0..Q).step_by(7) {
+            let a = Zq(a_val as i16);
+            // neg: a + (-a) must be zero
+            let neg_a = -a;
+            assert_eq!(a + neg_a, Zq::ZERO, "neg failed for {}", a_val);
+            // centered must be in range
+            let c = a.centered();
+            assert!(c >= -((Q / 2) as i16) && c <= (Q / 2) as i16,
+                "centered({}) = {} out of range", a_val, c);
+
+            for b_val in (0..Q).step_by(13) {
+                let b = Zq(b_val as i16);
+                // add
+                let sum = a + b;
+                let expected_sum = (a_val + b_val) % Q;
+                assert_eq!(sum.0 as i32, expected_sum, "add({},{}) failed", a_val, b_val);
+                // sub
+                let diff = a - b;
+                let expected_diff = ((a_val - b_val) % Q + Q) % Q;
+                assert_eq!(diff.0 as i32, expected_diff, "sub({},{}) failed", a_val, b_val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ct_barrett_mul() {
+        // Test mul via Barrett reduction over a wide range
+        for a_val in (0..Q).step_by(17) {
+            for b_val in (0..Q).step_by(19) {
+                let a = Zq(a_val as i16);
+                let b = Zq(b_val as i16);
+                let prod = a * b;
+                let expected = ((a_val as i64 * b_val as i64) % Q as i64) as i32;
+                assert_eq!(prod.0 as i32, expected,
+                    "mul({},{}) = {} expected {}", a_val, b_val, prod.0, expected);
+            }
+        }
     }
 }

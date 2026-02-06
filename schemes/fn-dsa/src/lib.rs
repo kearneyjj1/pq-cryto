@@ -35,13 +35,13 @@ pub mod error;
 pub mod fft;
 pub mod fft_tree;
 pub mod field;
-pub mod gaussian;
-pub mod hash;
+pub(crate) mod gaussian;
+pub(crate) mod hash;
 pub mod keygen;
-pub mod ntru;
+pub(crate) mod ntru;
 pub mod params;
 pub mod poly;
-pub mod sampler;
+pub(crate) mod sampler;
 pub mod sign;
 pub mod verify;
 
@@ -51,7 +51,7 @@ pub mod packing;
 pub use error::{FnDsaError, Result};
 pub use keygen::{KeyPair, PublicKey, SecretKey, keygen, keygen_512, keygen_1024, keygen_with_seed};
 pub use params::{Params, FALCON_512, FALCON_1024};
-pub use sign::{Signature, sign, sign_simple};
+pub use sign::{Signature, sign};
 pub use verify::verify;
 
 // Re-export packing functions

@@ -307,11 +307,21 @@ pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
     bytes
 }
 
-/// Encodes a signature with compression.
+/// Encodes a signature with Golomb-Rice compression.
 ///
-/// Uses Golomb-Rice style encoding for smaller signatures.
-/// Coefficients are encoded as: sign bit + absolute value in unary/binary hybrid.
+/// Per FIPS 206, each coefficient is encoded as:
+/// - Zero: 1 bit (the value 0)
+/// - Nonzero: 1 (flag) + 1 (sign) + k (low bits) + unary(high)
+///
+/// Where `low = (|val| - 1) mod 2^k`, `high = (|val| - 1) / 2^k`,
+/// and `unary(h) = h zero-bits followed by a 1-bit.
+///
+/// The parameter `k` (rice_k) controls the split: k = 8 for FALCON-512,
+/// k = 9 for FALCON-1024.
 pub fn encode_signature_compressed(sig: &Signature, n: usize) -> Vec<u8> {
+    let k = rice_k_for_n(n);
+    let k_mask = (1u64 << k) - 1;
+
     let mut bytes = Vec::with_capacity(4 + 2 + NONCE_SIZE + n);
 
     // Magic (different for compressed)
@@ -323,23 +333,39 @@ pub fn encode_signature_compressed(sig: &Signature, n: usize) -> Vec<u8> {
     // Nonce
     bytes.extend_from_slice(&sig.nonce);
 
-    // Compressed s2: use variable-length encoding
-    // For each coefficient, we encode:
-    // - 1 bit for sign (0 = positive/zero, 1 = negative)
-    // - remaining bits for absolute value using Golomb coding
+    // Bit-packing state
     let mut bit_buffer: u64 = 0;
-    let mut bit_count = 0;
+    let mut bit_count: usize = 0;
 
     for &coeff in &sig.s2 {
-        let sign = if coeff < 0 { 1u64 } else { 0u64 };
-        let abs_val = coeff.abs() as u64;
+        if coeff == 0 {
+            // Zero flag: single 0 bit
+            // bit_buffer |= 0 << bit_count; (no-op)
+            bit_count += 1;
+        } else {
+            // Nonzero flag: 1
+            bit_buffer |= 1u64 << bit_count;
+            bit_count += 1;
 
-        // Simple encoding: 1 bit sign + 12 bits value (enough for q=12289)
-        let encoded = (abs_val << 1) | sign;
+            // Sign bit: 0 = positive, 1 = negative
+            let sign = if coeff < 0 { 1u64 } else { 0u64 };
+            bit_buffer |= sign << bit_count;
+            bit_count += 1;
 
-        // Pack into bit buffer (13 bits per coefficient)
-        bit_buffer |= encoded << bit_count;
-        bit_count += 13;
+            // Encode abs_val - 1
+            let m = (coeff.unsigned_abs() - 1) as u64;
+            let low = m & k_mask;
+            let high = m >> k;
+
+            // Low bits (k bits, LSB-first)
+            bit_buffer |= low << bit_count;
+            bit_count += k;
+
+            // Unary: high zeros followed by a 1
+            bit_count += high as usize; // high zero bits (buffer already 0)
+            bit_buffer |= 1u64 << bit_count;
+            bit_count += 1;
+        }
 
         // Flush full bytes
         while bit_count >= 8 {
@@ -355,6 +381,14 @@ pub fn encode_signature_compressed(sig: &Signature, n: usize) -> Vec<u8> {
     }
 
     bytes
+}
+
+/// Returns the Golomb-Rice parameter k for a given polynomial degree n.
+fn rice_k_for_n(n: usize) -> usize {
+    match n {
+        1024 => 9,
+        _ => 8, // FALCON-512 and test params
+    }
 }
 
 /// Decodes a signature from bytes.
@@ -420,9 +454,12 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
     Ok((Signature { nonce, s2 }, n))
 }
 
-/// Decodes a compressed signature.
+/// Decodes a Golomb-Rice compressed signature.
 fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usize)> {
+    let k = rice_k_for_n(n);
+    let k_mask = (1u64 << k) - 1;
     let header_len = 6 + NONCE_SIZE;
+
     if bytes.len() < header_len {
         return Err(FnDsaError::InvalidInput {
             field: "signature",
@@ -434,49 +471,94 @@ fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usi
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&bytes[6..6 + NONCE_SIZE]);
 
-    // Decode s2 using bit unpacking
+    // Decode s2 using Golomb-Rice bit unpacking
     let mut s2 = Vec::with_capacity(n);
     let data = &bytes[header_len..];
 
     let mut bit_buffer: u64 = 0;
-    let mut bit_count = 0;
-    let mut byte_idx = 0;
+    let mut bit_count: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    // Helper: ensure at least `need` bits are buffered
+    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
+        while *bc < need && *bi < data.len() {
+            *buf |= (data[*bi] as u64) << *bc;
+            *bc += 8;
+            *bi += 1;
+        }
+    };
+
+    let max_coeff = (crate::params::Q / 2) as i16;
 
     for _ in 0..n {
-        // Ensure we have enough bits
-        while bit_count < 13 && byte_idx < data.len() {
-            bit_buffer |= (data[byte_idx] as u64) << bit_count;
-            bit_count += 8;
-            byte_idx += 1;
-        }
-
-        if bit_count < 13 {
+        // Read zero flag (1 bit)
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+        if bit_count < 1 {
             return Err(FnDsaError::InvalidInput {
                 field: "signature",
                 reason: "truncated compressed data",
             });
         }
+        let nonzero = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
 
-        // Extract 13 bits: 1 sign + 12 value
-        let encoded = bit_buffer & 0x1FFF;
-        bit_buffer >>= 13;
-        bit_count -= 13;
+        if nonzero == 0 {
+            s2.push(0i16);
+            continue;
+        }
 
-        let sign = encoded & 1;
-        let abs_val = (encoded >> 1) as i16;
-        let coeff = if sign == 1 { -abs_val } else { abs_val };
-        s2.push(coeff);
-    }
+        // Read sign (1 bit) + low (k bits) = 1 + k bits
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
+        if bit_count < 1 + k {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "truncated compressed data",
+            });
+        }
+        let sign = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
 
-    // Validate coefficient range: s2 should be in centered representation [-Q/2, Q/2]
-    let max_coeff = (crate::params::Q / 2) as i16;
-    for &coeff in &s2 {
-        if coeff < -max_coeff || coeff > max_coeff {
+        let low = bit_buffer & k_mask;
+        bit_buffer >>= k;
+        bit_count -= k;
+
+        // Read unary: count zeros until a 1
+        let mut high: u64 = 0;
+        loop {
+            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+            if bit_count < 1 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "truncated unary in compressed data",
+                });
+            }
+            let bit = bit_buffer & 1;
+            bit_buffer >>= 1;
+            bit_count -= 1;
+            if bit == 1 {
+                break;
+            }
+            high += 1;
+            // Safety limit: high should never exceed a few bits for valid signatures
+            if high > 64 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "unary overflow in compressed data",
+                });
+            }
+        }
+
+        let abs_val = ((high << k) | low) as i16 + 1;
+        if abs_val > max_coeff || abs_val < 0 {
             return Err(FnDsaError::InvalidInput {
                 field: "signature",
                 reason: "s2 coefficient out of range",
             });
         }
+        let coeff = if sign == 1 { -abs_val } else { abs_val };
+        s2.push(coeff);
     }
 
     Ok((Signature { nonce, s2 }, n))
@@ -602,12 +684,63 @@ mod tests {
         assert_eq!(sig.nonce, decoded.nonce);
         assert_eq!(sig.s2, decoded.s2);
 
-        // Compressed should be smaller
+        // Golomb-Rice compressed should be smaller than uncompressed (n*2 bytes for coeffs)
         let uncompressed = encode_signature(&sig, 512);
-        println!(
-            "Uncompressed: {} bytes, Compressed: {} bytes",
-            uncompressed.len(),
-            encoded.len()
+        assert!(
+            encoded.len() < uncompressed.len(),
+            "Compressed {} should be smaller than uncompressed {}",
+            encoded.len(),
+            uncompressed.len()
+        );
+    }
+
+    #[test]
+    fn test_signature_compressed_zeros() {
+        // All-zero signature: maximally compressible (1 bit per coeff)
+        let sig = Signature {
+            nonce: [0u8; NONCE_SIZE],
+            s2: vec![0i16; 512],
+        };
+
+        let encoded = encode_signature_compressed(&sig, 512);
+        let (decoded, n) = decode_signature(&encoded).unwrap();
+
+        assert_eq!(n, 512);
+        assert_eq!(sig.s2, decoded.s2);
+
+        // 512 coefficients * 1 bit each = 64 bytes for coeff data + header
+        let header = 4 + 2 + NONCE_SIZE; // 46
+        assert!(
+            encoded.len() <= header + 65, // 64 bytes of bits + 1 rounding
+            "All-zero compressed size {} should be near {} bytes",
+            encoded.len(),
+            header + 64
+        );
+    }
+
+    #[test]
+    fn test_signature_compressed_small_values() {
+        // Small values typical of real FALCON signatures
+        let sig = Signature {
+            nonce: [42u8; NONCE_SIZE],
+            s2: (0..512)
+                .map(|i| {
+                    let v = ((i as i16 * 13 + 7) % 30) - 15; // range [-15, 14]
+                    v
+                })
+                .collect(),
+        };
+
+        let encoded = encode_signature_compressed(&sig, 512);
+        let (decoded, _) = decode_signature(&encoded).unwrap();
+        assert_eq!(sig.s2, decoded.s2);
+
+        let uncompressed = encode_signature(&sig, 512);
+        assert!(
+            encoded.len() < uncompressed.len(),
+            "Small-value compressed {} < uncompressed {}",
+            encoded.len(),
+            uncompressed.len()
         );
     }
 
