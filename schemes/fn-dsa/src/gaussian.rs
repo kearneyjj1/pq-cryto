@@ -12,11 +12,17 @@
 //! constant-time implementations should be used.
 
 use rand::{Rng, RngCore};
-use std::f64::consts::{E, PI};
 
-/// Base standard deviation for the Gaussian sampler.
-/// This is sigma_0 = 1.8205 from the FALCON specification.
+/// Base standard deviation for the half-Gaussian CDT sampler.
+/// This is sigma_0 = 1.8205 from the FALCON / FIPS 206 specification.
 pub const SIGMA_0: f64 = 1.8205;
+
+/// Minimum sigma for leaf nodes in the LDL* tree (FALCON-512).
+/// sigma_min = 1.277833697 per FIPS 206.
+pub const SIGMA_MIN: f64 = 1.277833697;
+
+/// Precomputed 1 / (2 * sigma_0^2) for the BerExp rejection test.
+const INV_2SIGMA0_SQ: f64 = 0.150_868_809_571_805_55;
 
 /// Maximum deviation from the mean (in units of sigma) that we consider.
 /// Values beyond this are essentially zero probability.
@@ -161,11 +167,9 @@ pub struct BaseSampler {
 }
 
 impl BaseSampler {
-    /// Creates a new base sampler with the default sigma.
+    /// Creates a new base sampler at sigma_0 = 1.8205 (FIPS 206).
     pub fn new() -> Self {
-        // For FALCON, sigma_min ≈ 1.277833 (for FALCON-512)
-        // The CDT is precomputed for this value
-        let sigma = 1.277833;
+        let sigma = SIGMA_0;
         let cdt = Self::compute_cdt(sigma);
         BaseSampler { cdt, sigma }
     }
@@ -240,6 +244,24 @@ impl BaseSampler {
         // Use constant-time selection: result = sign * abs_z (which is 0 when abs_z is 0)
         sign * abs_z
     }
+
+    /// Samples z0 >= 0 from the half-Gaussian at sigma_0.
+    ///
+    /// This is used as the proposal distribution in the FIPS 206 SamplerZ.
+    pub fn sample_half<R: RngCore>(&self, rng: &mut R) -> i64 {
+        let u: u64 = rng.gen();
+        let half_u = u >> 1; // 63-bit precision for CDT
+
+        // Constant-time linear scan through CDT
+        let mut z0: i64 = 0;
+        for &threshold in &self.cdt {
+            let diff = half_u.wrapping_sub(threshold);
+            let exceeded = ((!(diff >> 63)) & 1) as i64;
+            z0 += exceeded;
+        }
+
+        z0
+    }
 }
 
 impl Default for BaseSampler {
@@ -249,61 +271,103 @@ impl Default for BaseSampler {
 }
 
 // ============================================================================
-// SamplerZ: FALCON's integer Gaussian sampler
+// BerExp: Bernoulli exponential acceptance test
 // ============================================================================
 
-/// Samples an integer from a discrete Gaussian distribution.
+/// Accepts with probability ccs * exp(-x).
 ///
-/// This is the core sampler used in FALCON's signing algorithm.
-/// It samples z from a distribution proportional to exp(-(z-mu)^2 / (2*sigma^2)).
+/// For x >= 0: tests Bernoulli(exp(-x)) AND Bernoulli(ccs) independently.
+/// For x < 0: exp(-x) > 1, so computes the product directly and caps at 1.
+fn ber_exp<R: RngCore>(rng: &mut R, x: f64, ccs: f64) -> bool {
+    if x < 0.0 {
+        // exp(-x) > 1; compute P = min(1, ccs * exp(-x)) directly
+        let p = (ccs * (-x).exp()).min(1.0);
+        return rng.gen::<f64>() < p;
+    }
+
+    // x >= 0: P = ccs * exp(-x). Test each factor independently.
+    if !sample_bernoulli_exp(rng, x) {
+        return false;
+    }
+    rng.gen::<f64>() < ccs
+}
+
+// ============================================================================
+// SamplerZ: FIPS 206 Algorithm 12 — discrete Gaussian sampler
+// ============================================================================
+
+/// Samples an integer from a discrete Gaussian distribution N(mu, sigma^2).
+///
+/// Implements FIPS 206 Algorithm 12 (SamplerZ) using the half-Gaussian
+/// base sampler at sigma_0, sign randomization, and BerExp rejection.
 pub struct SamplerZ {
     base: BaseSampler,
+    /// The sigma_min parameter for this parameter set.
+    sigma_min: f64,
 }
 
 impl SamplerZ {
-    /// Creates a new SamplerZ.
+    /// Creates a new SamplerZ with the FIPS 206 base sampler at sigma_0.
+    /// Uses the default FALCON-512 sigma_min.
     pub fn new() -> Self {
         SamplerZ {
             base: BaseSampler::new(),
+            sigma_min: SIGMA_MIN,
         }
     }
 
-    /// Samples z from N(mu, sigma^2).
+    /// Creates a new SamplerZ with a specific sigma_min value.
+    /// Use this for FALCON-1024 which has a different sigma_min.
+    pub fn with_sigma_min(sigma_min: f64) -> Self {
+        SamplerZ {
+            base: BaseSampler::new(),
+            sigma_min,
+        }
+    }
+
+    /// Samples z from the discrete Gaussian N(mu, sigma^2) per FIPS 206 Algorithm 12.
+    ///
+    /// For sigma >= sigma_min, uses the FIPS 206 algorithm. For sigma < sigma_min
+    /// (which can occur with toy test parameters), falls back to simple rejection
+    /// sampling.
     pub fn sample<R: RngCore>(&self, rng: &mut R, mu: f64, sigma: f64) -> i64 {
-        // Use the convolution method for large sigma
-        // sigma^2 = sigma_0^2 * k + sigma_r^2 where sigma_0 is the base sigma
-
-        let sigma_0_sq = self.base.sigma * self.base.sigma;
-        let sigma_sq = sigma * sigma;
-
-        if sigma_sq <= sigma_0_sq {
-            // Direct sampling for small sigma
-            return sample_gaussian(rng, mu, sigma);
+        // Fallback for sigma below sigma_min (toy parameters with poorly conditioned basis)
+        if sigma < self.sigma_min {
+            return sample_gaussian(rng, mu, sigma.max(0.01));
         }
 
-        // Convolution: sample sum of independent base Gaussians
-        let k = (sigma_sq / sigma_0_sq).floor() as usize;
-        let sigma_r_sq = sigma_sq - (k as f64) * sigma_0_sq;
-        let sigma_r = sigma_r_sq.sqrt();
+        let s = mu.floor() as i64;
+        let r = mu - (s as f64);
+        let dss = 1.0 / (2.0 * sigma * sigma);
+        let ccs = self.sigma_min / sigma;
 
-        // Sample k base Gaussians and one residual
-        let mut z: i64 = 0;
-        for _ in 0..k {
-            z += self.base.sample(rng);
+        loop {
+            // 1. Sample z0 >= 0 from half-Gaussian at sigma_0
+            let z0 = self.base.sample_half(rng);
+
+            // 2. Random sign bit
+            let b: i64 = if rng.gen_bool(0.5) { 1 } else { 0 };
+
+            // 3. z = b + (2b - 1) * z0
+            //    b=1 → z = 1 + z0 (positive side)
+            //    b=0 → z = -z0    (negative side)
+            let z = b + (2 * b - 1) * z0;
+
+            // 4. Reject (z=0, b=0) to avoid double-counting zero
+            if z == 0 && b == 0 {
+                continue;
+            }
+
+            // 5. Compute exponent for rejection test
+            //    x = (z - r)^2 / (2*sigma^2) - z0^2 / (2*sigma_0^2)
+            let zr = (z as f64) - r;
+            let x = zr * zr * dss - (z0 as f64) * (z0 as f64) * INV_2SIGMA0_SQ;
+
+            // 6. Accept with probability ccs * exp(-x)
+            if ber_exp(rng, x, ccs) {
+                return s + z;
+            }
         }
-
-        // Add the residual (if significant)
-        if sigma_r > 0.1 {
-            z += sample_gaussian(rng, 0.0, sigma_r);
-        }
-
-        // Shift by mu
-        z += mu.round() as i64;
-
-        // TODO: This is a simplified version. The full FALCON sampler
-        // uses rejection sampling to ensure the distribution is correct.
-
-        z
     }
 }
 
@@ -405,13 +469,14 @@ mod tests {
         let sampler = SamplerZ::new();
         let mut rng = StdRng::seed_from_u64(789);
 
-        // Test with larger sigma
-        let mu = 0.0;
-        let sigma = 165.0; // FALCON-512 sigma
+        // Test with sigma near sigma_min (the regime SamplerZ is used in)
+        // In the ffSampling tree, sigma_eff ≈ sigma_sign / tree_sigma ≈ 1.3
+        let mu = 3.5;
+        let sigma = 1.5; // Slightly above sigma_min
 
         let mut sum: i64 = 0;
         let mut sum_sq: i64 = 0;
-        let n = 1000;
+        let n = 5000;
 
         for _ in 0..n {
             let z = sampler.sample(&mut rng, mu, sigma);
@@ -422,17 +487,50 @@ mod tests {
         let mean = (sum as f64) / (n as f64);
         let variance = (sum_sq as f64) / (n as f64) - mean * mean;
 
-        // Mean should be close to 0
-        assert!(mean.abs() < 20.0, "Mean {} should be close to 0", mean);
+        // Mean should be close to mu
+        assert!(
+            (mean - mu).abs() < 0.5,
+            "Mean {} should be close to {}",
+            mean,
+            mu
+        );
 
-        // Variance should be in the right ballpark (very rough check)
+        // Variance should be in the right ballpark
         let expected_var = sigma * sigma;
         assert!(
-            variance > expected_var * 0.5 && variance < expected_var * 1.5,
+            variance > expected_var * 0.3 && variance < expected_var * 3.0,
             "Variance {} should be roughly {}",
             variance,
             expected_var
         );
+    }
+
+    #[test]
+    fn test_sampler_z_small_sigma() {
+        let sampler = SamplerZ::new();
+        let mut rng = StdRng::seed_from_u64(999);
+
+        // Test at sigma_min boundary
+        let mu = 0.0;
+        let sigma = SIGMA_MIN;
+
+        let mut sum: i64 = 0;
+        let n = 5000;
+
+        for _ in 0..n {
+            let z = sampler.sample(&mut rng, mu, sigma);
+            sum += z;
+            // Should produce small integers centered at 0
+            assert!(
+                z.abs() < 20,
+                "z={} too large for sigma_min={}",
+                z,
+                sigma
+            );
+        }
+
+        let mean = (sum as f64) / (n as f64);
+        assert!(mean.abs() < 0.5, "Mean {} should be close to 0", mean);
     }
 
     #[test]

@@ -2,18 +2,46 @@
 //!
 //! This module implements the FALCON signature generation algorithm,
 //! which uses Fast Fourier Sampling to produce compact signatures.
+//!
+//! ## Basis Convention
+//!
+//! The NTRU lattice for public key `h = g·f⁻¹ mod q` is:
+//!
+//! ```text
+//!   L = { (u, v) ∈ (Z[x]/(xⁿ+1))² : u + v·h ≡ 0 (mod q) }
+//! ```
+//!
+//! The secret short basis has rows `(g, -f)` and `(G, -F)`:
+//!
+//! ```text
+//!   B = [[g, -f], [G, -F]]       (row-vector convention: v·B ∈ L)
+//! ```
+//!
+//! Verification: both rows are in L since `g - f·h = 0` and `G - F·h ≡ 0 (mod q)`
+//! (the latter from `fG - gF = q`).
+//!
+//! With `det(B) = fG - gF = q`, the inverse is:
+//!
+//! ```text
+//!   B⁻¹ = (1/q) · [[-F, f], [-G, g]]
+//! ```
+//!
+//! The signature `(s1, s2) = (c, 0) - (z0, z1)·B` gives:
+//!
+//! ```text
+//!   s1 = c - z0·g - z1·G
+//!   s2 = z0·f + z1·F
+//! ```
+//!
+//! Verify: `s1 + s2·h = c - z0·g - z1·G + (z0·f + z1·F)·g/f = c` since `F·g/f ≡ G (mod q)`.
 
-use std::sync::Once;
 use rand::RngCore;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
 use crate::hash::{generate_nonce, hash_to_point};
 use crate::keygen::SecretKey;
-use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE, FALCON_512};
+use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE};
 use crate::sampler::{FfSampler, SimpleSampler};
-
-/// Warning printed once for FALCON-512 relaxed bounds.
-static FALCON_512_WARNING: Once = Once::new();
 
 /// A FALCON signature.
 #[derive(Clone, Debug)]
@@ -46,27 +74,19 @@ impl Signature {
 /// This is the main signing function. It:
 /// 1. Generates a random nonce
 /// 2. Hashes the message to a polynomial c
-/// 3. Computes the target t = (c, 0)
-/// 4. Samples a lattice vector (z0, z1) close to t using FFT sampling
-/// 5. Computes s2 = c - z0*f - z1*F
-/// 6. Checks if the norm is acceptable
+/// 3. Computes target t = (c, 0)·B⁻¹ = (-F·c/q, f·c/q) via ffSampling
+/// 4. Samples (z0, z1) close to t using FFT sampling
+/// 5. Computes s2 = z0·f + z1·F (see module docs for basis convention)
+/// 6. Derives s1 = c - s2·h and checks ||(s1, s2)|| is within bounds
 /// 7. Returns the signature (nonce, s2)
 pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     let n = sk.params.n;
     let sigma = sk.params.sigma;
+    let sigma_min = sk.params.sigma_min;
     let bound_sq = sk.params.sig_bound_sq;
 
-    // Warn once if using FALCON-512 with relaxed bounds
-    if sk.params.n == FALCON_512.n && sk.params.sig_bound_sq == FALCON_512.sig_bound_sq {
-        FALCON_512_WARNING.call_once(|| {
-            eprintln!("WARNING: FALCON-512 is using relaxed signature bounds (~200x larger than standard).");
-            eprintln!("         This implementation uses simplified sampling and is NOT suitable for production.");
-            eprintln!("         See SECURITY.md for details.");
-        });
-    }
-
-    // Create the FFT sampler using the Gram-Schmidt data from the secret key
-    let ff_sampler = FfSampler::new(sk.gs.clone());
+    // Create the FFT sampler using the LDL* tree from the secret key
+    let ff_sampler = FfSampler::new(sk.gs.clone(), sigma, sigma_min);
 
     // Precompute FFT forms of the secret key polynomials
     let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -90,10 +110,13 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         let mut c_fft: Vec<Complex> = c.iter().map(|zq| Complex::from_real(zq.value() as f64)).collect();
         fft(&mut c_fft);
 
-        // Use the FFT sampler to sample (z0, z1) close to the target
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft, sigma);
+        // Use ffSampling to sample (z0, z1) close to the target
+        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft);
 
-        // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
+        // Compute s2 = z0·f + z1·F (in FFT form, then convert back).
+        // This is the second component of (c, 0) - (z0, z1)·B where
+        // B = [[g, -f], [G, -F]] is the NTRU secret basis.
+        // See module-level documentation for the full derivation.
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
         for i in 0..n {
             s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
@@ -259,7 +282,6 @@ pub fn sign_with_nonce<R: RngCore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::FALCON_512;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 

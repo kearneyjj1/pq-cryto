@@ -7,15 +7,16 @@
 //! The tree has log2(n) + 1 levels, where each level stores the
 //! Gram-Schmidt data for that recursion level.
 
-use crate::fft::{merge_fft, split_fft, Complex};
+use crate::fft::{split_fft, Complex};
 
-/// A node in the FFT tree storing Gram-Schmidt data.
+/// A node in the FFT tree storing LDL* decomposition data.
 #[derive(Clone, Debug)]
 pub struct FftNode {
-    /// The sigma values (standard deviations) for this node.
+    /// The sigma values: sqrt of the LDL* diagonal at this level.
     pub sigma: Vec<f64>,
-    /// The Gram-Schmidt coefficients for this node.
-    pub gs_coeffs: Vec<Complex>,
+    /// The l10 values: off-diagonal factor from LDL* decomposition.
+    /// At the base case (n=1), l10 has one element.
+    pub l10: Vec<Complex>,
 }
 
 impl FftNode {
@@ -23,13 +24,13 @@ impl FftNode {
     pub fn empty() -> Self {
         FftNode {
             sigma: Vec::new(),
-            gs_coeffs: Vec::new(),
+            l10: Vec::new(),
         }
     }
 
     /// Creates a node with the given data.
-    pub fn new(sigma: Vec<f64>, gs_coeffs: Vec<Complex>) -> Self {
-        FftNode { sigma, gs_coeffs }
+    pub fn new(sigma: Vec<f64>, l10: Vec<Complex>) -> Self {
+        FftNode { sigma, l10 }
     }
 }
 
@@ -90,9 +91,10 @@ impl FftTree {
         1 << level
     }
 
-    /// Builds the FFT tree from the secret key polynomials.
+    /// Builds the FFT tree from the secret key polynomials using ffLDL*.
     ///
-    /// Given (f, g, F, G) in FFT form, builds the tree for sampling.
+    /// Given (f, g, F, G) in FFT form, computes the initial Gram matrix and
+    /// builds the LDL* tree recursively per FIPS 206.
     pub fn build_from_basis(
         f_fft: &[Complex],
         g_fft: &[Complex],
@@ -102,94 +104,92 @@ impl FftTree {
         let n = f_fft.len();
         let mut tree = FftTree::new(n);
 
-        // Build recursively
-        tree.build_level(0, 0, f_fft, g_fft, big_f_fft, big_g_fft);
+        // Compute the initial Gram matrix G = B * adj(B)
+        // where B = [[f, g], [F, G]] in FFT form.
+        // g00[i] = |f[i]|^2 + |g[i]|^2  (real)
+        // g01[i] = f[i]*conj(F[i]) + g[i]*conj(G[i])  (complex)
+        // g11[i] = |F[i]|^2 + |G[i]|^2  (real)
+        let g00: Vec<f64> = (0..n)
+            .map(|i| f_fft[i].norm_sq() + g_fft[i].norm_sq())
+            .collect();
+        let g01: Vec<Complex> = (0..n)
+            .map(|i| f_fft[i] * big_f_fft[i].conj() + g_fft[i] * big_g_fft[i].conj())
+            .collect();
+        let g11: Vec<f64> = (0..n)
+            .map(|i| big_f_fft[i].norm_sq() + big_g_fft[i].norm_sq())
+            .collect();
+
+        tree.ffldl_recursive(0, 0, &g00, &g01, &g11);
 
         tree
     }
 
-    /// Recursively builds a level of the tree.
-    fn build_level(
+    /// Recursively builds the ffLDL* tree from a 2x2 Hermitian Gram matrix.
+    ///
+    /// At each level, computes the LDL* decomposition:
+    ///   G = [[g00, g01], [conj(g01), g11]] = L * D * L*
+    /// where L = [[1, 0], [l10, 1]], D = diag(d0, d1)
+    ///
+    /// Then stores sigma = sqrt(d0) and l10 at this node, and recurses
+    /// on the children using the FFT-split of d0 and d1.
+    fn ffldl_recursive(
         &mut self,
         level: usize,
         pos: usize,
-        f_fft: &[Complex],
-        g_fft: &[Complex],
-        big_f_fft: &[Complex],
-        big_g_fft: &[Complex],
+        g00: &[f64],
+        g01: &[Complex],
+        g11: &[f64],
     ) {
-        let n = f_fft.len();
+        let n = g00.len();
 
         if n == 1 {
-            // Base case: compute the Gram-Schmidt data for a 2x2 matrix
-            // [[f, g], [F, G]] forms the basis
-            // Gram-Schmidt: b1 = (f, g), b2 = (F, G) - proj_{b1}(b2) * b1
+            // Base case: scalar LDL* decomposition
+            let d0 = g00[0];
+            let l10 = g01[0].conj().scale(1.0 / d0);
+            let d1 = g11[0] - g01[0].norm_sq() / d0;
 
-            let f = f_fft[0];
-            let g = g_fft[0];
-            let big_f = big_f_fft[0];
-            let big_g = big_g_fft[0];
-
-            // ||(f, g)||^2
-            let norm_b1_sq = f.norm_sq() + g.norm_sq();
-
-            // <(F, G), (f, g)>
-            let inner = big_f * f.conj() + big_g * g.conj();
-
-            // mu = inner / norm_b1_sq
-            let mu = inner.scale(1.0 / norm_b1_sq);
-
-            // b2* = (F, G) - mu * (f, g)
-            let b2_star_f = big_f - mu * f;
-            let b2_star_g = big_g - mu * g;
-            let norm_b2_star_sq = b2_star_f.norm_sq() + b2_star_g.norm_sq();
-
-            // Sigma values: sqrt of the squared norms
-            let sigma = vec![norm_b1_sq.sqrt(), norm_b2_star_sq.sqrt()];
-            let gs_coeffs = vec![mu];
-
-            self.set_node(level, pos, FftNode::new(sigma, gs_coeffs));
+            let sigma = vec![d0.sqrt(), d1.max(0.0).sqrt()];
+            self.set_node(level, pos, FftNode::new(sigma, vec![l10]));
             return;
         }
 
-        // Recursive case: split into two half-size problems
-        let (f0, f1) = split_fft(f_fft);
-        let (g0, g1) = split_fft(g_fft);
-        let (big_f0, big_f1) = split_fft(big_f_fft);
-        let (big_g0, big_g1) = split_fft(big_g_fft);
-
-        // Compute the Gram-Schmidt data for this level
-        // The Gram matrix at this level involves the field norms
-
-        // For the FFT tree, we store:
-        // - sigma: the Gram-Schmidt sigma values
-        // - gs_coeffs: the projection coefficients
-
-        // Compute Gram matrix entries
-        // G = [[<(f,g), (f,g)>, <(f,g), (F,G)>],
-        //      [<(F,G), (f,g)>, <(F,G), (F,G)>]]
-
-        let mut norm_fg_sq = vec![Complex::ZERO; n];
-        let mut inner_fgFG = vec![Complex::ZERO; n];
-        let mut norm_FG_sq = vec![Complex::ZERO; n];
+        // Pointwise LDL* decomposition
+        let mut d0 = vec![0.0f64; n];
+        let mut l10 = vec![Complex::ZERO; n];
+        let mut d1 = vec![0.0f64; n];
 
         for i in 0..n {
-            norm_fg_sq[i] = Complex::from_real(f_fft[i].norm_sq() + g_fft[i].norm_sq());
-            inner_fgFG[i] = f_fft[i] * big_f_fft[i].conj() + g_fft[i] * big_g_fft[i].conj();
-            norm_FG_sq[i] = Complex::from_real(big_f_fft[i].norm_sq() + big_g_fft[i].norm_sq());
+            d0[i] = g00[i];
+            l10[i] = g01[i].conj().scale(1.0 / g00[i]);
+            d1[i] = g11[i] - g01[i].norm_sq() / g00[i];
+            // Clamp d1 to avoid negative values from floating-point error
+            if d1[i] < 0.0 {
+                d1[i] = 0.0;
+            }
         }
 
-        // Compute sigma from the diagonal of the Gram matrix
-        let sigma: Vec<f64> = norm_fg_sq.iter().map(|c| c.re.sqrt()).collect();
+        // Store sigma = sqrt(d0) and l10 at this node
+        let sigma: Vec<f64> = d0.iter().map(|&x| x.sqrt()).collect();
+        self.set_node(level, pos, FftNode::new(sigma, l10));
 
-        // Store this level's data
-        self.set_node(level, pos, FftNode::new(sigma, inner_fgFG.clone()));
+        // Split d0 and d1 into even/odd halves via FFT splitting
+        let d0_complex: Vec<Complex> = d0.iter().map(|&x| Complex::from_real(x)).collect();
+        let d1_complex: Vec<Complex> = d1.iter().map(|&x| Complex::from_real(x)).collect();
 
-        // Recurse on children
-        // Left child uses f0, g0
-        // Right child uses f1, g1
-        self.build_level(level + 1, 2 * pos, &f0, &g0, &big_f0, &big_g0);
-        self.build_level(level + 1, 2 * pos + 1, &f1, &g1, &big_f1, &big_g1);
+        let (d0_even, d0_odd) = split_fft(&d0_complex);
+        let (d1_even, d1_odd) = split_fft(&d1_complex);
+
+        // Left child: Gram matrix from split of d0
+        // [[Re(d0_even), d0_odd], [conj(d0_odd), Re(d0_even)]]
+        let g00_left: Vec<f64> = d0_even.iter().map(|c| c.re).collect();
+        let g11_left = g00_left.clone();
+
+        // Right child: Gram matrix from split of d1
+        let g00_right: Vec<f64> = d1_even.iter().map(|c| c.re).collect();
+        let g11_right = g00_right.clone();
+
+        self.ffldl_recursive(level + 1, 2 * pos, &g00_left, &d0_odd, &g11_left);
+        self.ffldl_recursive(level + 1, 2 * pos + 1, &g00_right, &d1_odd, &g11_right);
     }
 
     /// Gets the sigma value at a given level and position.

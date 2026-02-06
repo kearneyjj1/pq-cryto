@@ -9,7 +9,7 @@ use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::field::Zq;
-use crate::gaussian::sample_z_gaussian;
+use crate::gaussian::SamplerZ;
 use crate::ntru::ntru_solve;
 use crate::params::{Params, Q, FALCON_512, FALCON_1024};
 use crate::poly::ntt;
@@ -88,12 +88,19 @@ pub struct KeyPair {
     pub sk: SecretKey,
 }
 
-/// Sigma for key generation polynomial sampling.
-/// This is derived from the FALCON specification: sigma_keygen = 1.17 * sqrt(q / (2*n)) approximately.
-/// For n=512: 1.17 * sqrt(12289/1024) ≈ 4.0
-/// For n=1024: 1.17 * sqrt(12289/2048) ≈ 2.9
-/// We use a moderate value - too large causes field norms to grow too fast.
-const KEYGEN_SIGMA: f64 = 1.5;
+/// Computes the keygen sigma for polynomial sampling per FIPS 206.
+///
+/// sigma_keygen = 1.17 * sqrt(q / (2*n))
+/// - n=512:  ~4.05
+/// - n=1024: ~2.87
+/// For small test parameters (n < 256), uses a fixed moderate value since
+/// the FIPS 206 formula produces unreasonably large sigmas.
+fn keygen_sigma(n: usize) -> f64 {
+    if n < 256 {
+        return 1.5; // Moderate value for toy test parameters
+    }
+    1.17 * ((Q as f64) / (2.0 * n as f64)).sqrt()
+}
 
 /// Optimal weight for ternary polynomials.
 /// FALCON specification recommends weight ≈ n/4 for good security/efficiency trade-off.
@@ -103,14 +110,15 @@ fn optimal_weight(n: usize) -> usize {
 
 /// Generates a random polynomial with small coefficients using discrete Gaussian sampling.
 ///
-/// Coefficients are sampled from a discrete Gaussian distribution N(0, sigma^2).
-/// This is the proper FALCON distribution for key generation.
-fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize) -> Vec<i8> {
+/// Coefficients are sampled from a discrete Gaussian distribution N(0, sigma^2)
+/// using the FIPS 206 SamplerZ algorithm (Algorithm 12).
+fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8> {
+    let sampler = SamplerZ::new();
     let mut poly = vec![0i8; n];
 
     for i in 0..n {
-        // Sample from discrete Gaussian
-        let z = sample_z_gaussian(rng, KEYGEN_SIGMA);
+        // Sample from discrete Gaussian using FIPS 206 SamplerZ
+        let z = sampler.sample(rng, 0.0, sigma);
         // Clamp to i8 range (coefficients should be small, but clamp for safety)
         poly[i] = z.clamp(-127, 127) as i8;
     }
@@ -123,13 +131,14 @@ fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize) -> Vec<i8> {
 /// Uses a hybrid approach: mostly small Gaussian coefficients with a few
 /// larger values to ensure good algebraic properties.
 fn generate_ntru_poly<R: RngCore>(rng: &mut R, n: usize, ensure_odd: bool) -> Vec<i8> {
+    let sampler = SamplerZ::new();
     let mut poly = vec![0i8; n];
 
     // Use smaller sigma for most coefficients
     let sigma = if n <= 64 { 1.2 } else { 1.0 };
 
     for i in 0..n {
-        let z = sample_z_gaussian(rng, sigma);
+        let z = sampler.sample(rng, 0.0, sigma);
         poly[i] = z.clamp(-4, 4) as i8;
     }
 
@@ -243,7 +252,9 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
     };
 
     // Maximum norm for f, g polynomials (to keep field norms manageable)
-    let max_fg_norm_sq = (n as i64) * 16; // Allow coefficients up to ~4 on average
+    // With keygen_sigma(n), E[||f||^2] = n * sigma^2. Allow ~3x that.
+    let sigma = keygen_sigma(n);
+    let max_fg_norm_sq = (3.0 * (n as f64) * sigma * sigma) as i64;
 
     // Coefficient bound for F, G (relaxed for larger n)
     let coeff_bound = if n <= 64 {
@@ -259,7 +270,8 @@ pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
         let (f, g) = match attempt % 3 {
             0 => {
                 // Strategy 1: Gaussian sampling (most common)
-                (generate_small_poly(rng, n), generate_small_poly(rng, n))
+                let sigma = keygen_sigma(n);
+                (generate_small_poly(rng, n, sigma), generate_small_poly(rng, n, sigma))
             }
             1 => {
                 // Strategy 2: NTRU-optimized sampling with odd f[0]
@@ -373,14 +385,15 @@ mod tests {
     fn test_generate_small_poly() {
         let mut rng = StdRng::seed_from_u64(42);
         let n = 64;
-        let poly = generate_small_poly(&mut rng, n);
+        let sigma = keygen_sigma(n);
+        let poly = generate_small_poly(&mut rng, n, sigma);
 
         assert_eq!(poly.len(), n);
 
-        // With Gaussian sampling (sigma=1.5), most coefficients should be small
-        // Check that coefficients are reasonably bounded (within 5*sigma = 7.5)
+        // keygen_sigma(64) = 1.5 (capped for small n)
+        // Coefficients should be within ~5*sigma ≈ 7.5
         for &c in &poly {
-            assert!(c.abs() <= 10, "Coefficient {} is too large for sigma=1.5", c);
+            assert!(c.abs() <= 10, "Coefficient {} is too large for sigma={:.1}", c, sigma);
         }
 
         // Check that we have a mix of positive and negative values
@@ -428,6 +441,7 @@ mod tests {
             n,
             log_n,
             sigma: 165.0,
+            sigma_min: 1.2778336969128337,
             sig_bound_sq: 34034726.0,
             pk_bytes: 64,
             sk_bytes: 128,
@@ -441,8 +455,9 @@ mod tests {
 
             // Custom keygen with more attempts
             for _ in 0..max_attempts {
-                let f = generate_small_poly(&mut rng, n);
-                let g = generate_small_poly(&mut rng, n);
+                let sigma = keygen_sigma(n);
+                let f = generate_small_poly(&mut rng, n, sigma);
+                let g = generate_small_poly(&mut rng, n, sigma);
 
                 if !is_invertible(&f, n) {
                     continue;
@@ -473,65 +488,47 @@ mod tests {
 
     #[test]
     fn test_keygen_16_direct() {
-        // Test keygen_16 function directly with debugging
-        use crate::params::FALCON_16;
-
-        let seed = 12345u64;
-        let mut rng = StdRng::seed_from_u64(seed);
+        // Test keygen_16 function directly with debugging.
+        // Try multiple seeds since SamplerZ consumes RNG differently than naive sampling.
         let n = 16;
-        let mut ntru_success = 0;
-        let mut pk_success = 0;
+        let sigma = keygen_sigma(n);
 
-        for attempt in 0..1000 {
-            let f = generate_small_poly(&mut rng, n);
-            let g = generate_small_poly(&mut rng, n);
+        for seed in 0..20u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut ntru_success = 0;
 
-            // Check f[0] is non-zero (required for Newton iteration)
-            if f[0] == 0 {
-                continue;
-            }
+            for attempt in 0..500 {
+                let f = generate_small_poly(&mut rng, n, sigma);
+                let g = generate_small_poly(&mut rng, n, sigma);
 
-            if !is_invertible(&f, n) {
-                continue;
-            }
-
-            let ntru_result = ntru_solve(&f, &g, n);
-            let (big_f, big_g) = match ntru_result {
-                Ok(result) => {
-                    ntru_success += 1;
-                    result
+                if f[0] == 0 || !is_invertible(&f, n) {
+                    continue;
                 }
-                Err(_) => continue,
-            };
 
-            // Check coefficient bounds
-            let big_f_max: i64 = big_f.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
-            let big_g_max: i64 = big_g.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
-            let coeff_bound = 2 * (Q as i64);
-            if big_f_max > coeff_bound || big_g_max > coeff_bound {
-                continue;
-            }
-
-            // Try compute_public_key
-            match compute_public_key(&f, &g) {
-                Ok(_h) => {
-                    pk_success += 1;
-                    println!("Success at attempt {}: NTRU solved, public key computed", attempt);
-                    return;
-                }
-                Err(e) => {
-                    if ntru_success <= 3 {
-                        // Print first few failures for debugging
-                        println!("f = {:?}", f);
-                        println!("g = {:?}", g);
+                let (big_f, big_g) = match ntru_solve(&f, &g, n) {
+                    Ok(result) => {
+                        ntru_success += 1;
+                        result
                     }
-                    println!("Attempt {}: NTRU ok, but public key failed: {}", attempt, e);
+                    Err(_) => continue,
+                };
+
+                // Check coefficient bounds
+                let big_f_max: i64 = big_f.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
+                let big_g_max: i64 = big_g.iter().map(|&x| (x as i64).abs()).max().unwrap_or(0);
+                let coeff_bound = 2 * (Q as i64);
+                if big_f_max > coeff_bound || big_g_max > coeff_bound {
+                    continue;
+                }
+
+                if let Ok(_h) = compute_public_key(&f, &g) {
+                    println!("Success at seed={}, attempt {}: NTRU solved, public key computed", seed, attempt);
+                    return;
                 }
             }
         }
 
-        println!("Stats: NTRU success={}, PK success={}", ntru_success, pk_success);
-        panic!("keygen_16 failed");
+        panic!("keygen_16 failed across all seeds");
     }
 
     #[test]

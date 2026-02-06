@@ -28,6 +28,10 @@ pub struct Params {
     /// This is sigma = 1.17 * sqrt(q) * sqrt(2n / (2n-1)) approximately.
     pub sigma: f64,
 
+    /// Minimum standard deviation at LDL* tree leaves (sigma_min).
+    /// Different for FALCON-512 vs FALCON-1024 per the specification.
+    pub sigma_min: f64,
+
     /// Signature bound squared (for norm checking).
     pub sig_bound_sq: f64,
 
@@ -76,14 +80,12 @@ impl Params {
 pub const FALCON_512: Params = Params {
     n: 512,
     log_n: 9,
-    // sigma = 1.17 * sqrt(q) * sqrt(2*512 / (2*512 - 1)) ≈ 165.7366171...
-    sigma: 165.7366171228152,
-    // sig_bound^2 - VERY relaxed for educational implementation
-    // WARNING: Real FALCON uses sig_bound_sq ≈ 34034726 (about 200x smaller)
-    // Proper FALCON uses sophisticated FFT lattice sampling (ffSampling)
-    // which produces short signatures. Our simplified sampling doesn't
-    // achieve this, so we use a much larger bound for demo purposes.
-    sig_bound_sq: 10000000000.0,
+    // sigma = 1.17 * sqrt(q) * sqrt(2*512 / (2*512 - 1)) per reference impl
+    sigma: 165.7366171829776,
+    sigma_min: 1.2778336969128337,
+    // sig_bound^2 per FIPS 206: floor(beta^2 * 2n * sigma^2)
+    // = floor(1.1^2 * 2 * 512 * 165.7366...^2) ≈ 34,034,726
+    sig_bound_sq: 34_034_726.0,
     pk_bytes: 897,
     sk_bytes: 1281,
     sig_bytes_max: 809, // Worst case, typical is ~666
@@ -102,8 +104,9 @@ pub const FALCON_512: Params = Params {
 pub const FALCON_1024: Params = Params {
     n: 1024,
     log_n: 10,
-    // sigma = 1.17 * sqrt(q) * sqrt(2*1024 / (2*1024 - 1)) ≈ 168.3885714...
-    sigma: 168.38857144162388,
+    // sigma = 1.17 * sqrt(q) * sqrt(2*1024 / (2*1024 - 1)) per reference impl
+    sigma: 168.38857144654395,
+    sigma_min: 1.298280334344292,
     // sig_bound^2 = (1.1 * sigma * sqrt(2n))^2
     sig_bound_sq: 70265242.0,
     pk_bytes: 1793,
@@ -117,12 +120,18 @@ pub const FALCON_1024: Params = Params {
 /// - Polynomial degree: n = 16
 /// - This is a toy parameter set for unit testing.
 /// - DO NOT USE IN PRODUCTION.
+///
+/// NOTE: NTRUSolve for small n produces F, G with large coefficients,
+/// so signatures are much larger than standard FALCON. We use a very
+/// relaxed bound that allows valid signatures while still rejecting
+/// wrong-message verifications.
 #[cfg(test)]
 pub const FALCON_16: Params = Params {
     n: 16,
     log_n: 4,
-    sigma: 20.0,
-    sig_bound_sq: 10000.0,
+    sigma: 165.7, // Use FALCON-512 sigma for consistency
+    sigma_min: 1.2778336969128337, // Use FALCON-512 value
+    sig_bound_sq: 6e8, // 600M — relaxed for n=16 (NTRUSolve produces large F,G)
     pk_bytes: 64,
     sk_bytes: 128,
     sig_bytes_max: 64,
@@ -134,8 +143,8 @@ pub const FALCON_16: Params = Params {
 pub const BETA: f64 = 0.5;
 
 /// Maximum number of signing attempts before giving up.
-/// Increased for educational implementation which may produce larger norm signatures.
-pub const MAX_SIGN_ATTEMPTS: u32 = 500;
+/// With proper ffSampling, signing typically succeeds within a few attempts.
+pub const MAX_SIGN_ATTEMPTS: u32 = 100;
 
 /// Nonce size in bytes for signing.
 pub const NONCE_SIZE: usize = 40;
@@ -194,8 +203,8 @@ mod tests {
         let bound_512 = FALCON_512.sig_bound();
         let bound_1024 = FALCON_1024.sig_bound();
 
-        // FALCON-512: sqrt(10000000000) ≈ 100000 (very relaxed for educational impl)
-        assert!(bound_512 > 99000.0 && bound_512 < 101000.0);
+        // FALCON-512: sqrt(34034726) ≈ 5834
+        assert!(bound_512 > 5800.0 && bound_512 < 5900.0);
 
         // FALCON-1024: sqrt(70265242) ≈ 8382
         assert!(bound_1024 > 8300.0 && bound_1024 < 8400.0);
