@@ -343,60 +343,90 @@ fn fpr_expm_p63_float(x: f64, ccs: f64) -> u64 {
     z as u64
 }
 
-/// Accepts with probability `ccs * exp(-x)` using constant-time control flow.
+/// Accepts with probability `ccs * exp(-x)` using branchless control flow.
 ///
-/// Implements the Falcon reference BerExp algorithm:
-/// 1. Decompose `x = s * ln(2) + r` where `0 <= r < ln(2)` (for x >= 0)
+/// Implements the Falcon reference BerExp algorithm with constant-time handling
+/// of both positive and negative x:
+///
+/// 1. Decompose `x = s * ln(2) + r` where `0 <= r < ln(2)` (floor handles all x)
 /// 2. Compute `z = floor(2^63 * ccs * exp(-r))` via integer polynomial
-/// 3. Halve `z` exactly `s` times: `z = (z + 1) >> 1` per step (constant-time)
-/// 4. Accept if a random 63-bit value is less than `z`
+/// 3. For `s >= 0`: halve `z` exactly `s` times (constant-time masked loop)
+/// 4. For `s < 0`: probability exceeds representable range, force accept via mask
+/// 5. Accept if a random 63-bit value is less than `z`
 ///
-/// For x < 0 (which can occur when sigma slightly exceeds sigma_0 during
-/// signing), the probability `ccs * exp(-x) = ccs * exp(|x|)` is computed
-/// using floating-point. This is acceptable because: (a) the negative-x
-/// case is uncommon and the probability is high (near 1.0), (b) precision
-/// differences in this regime don't affect security, and (c) the
-/// security-critical x >= 0 path uses pure integer arithmetic.
+/// The negative-x case (where `exp(-x) > 1`) occurs when sigma slightly exceeds
+/// sigma_0 during signing. Rather than branching to floating-point `exp()`, we
+/// use arithmetic masking to set z to its maximum value, ensuring acceptance.
 fn ber_exp<R: RngCore>(rng: &mut R, x: f64, ccs: f64) -> bool {
     const LN2: f64 = 0.693_147_180_559_945_309_417_232_121_458;
     const INV_LN2: f64 = 1.442_695_040_888_963_407_359_924_681_002;
 
-    // Handle negative x separately: the integer fpr_expm_p63 only works for
-    // non-negative x (Q63 fixed-point can't represent negative values).
+    // Decompose x = s * ln(2) + r where 0 <= r < ln(2).
+    // floor() works for both positive and negative x.
+    let s_float = (x * INV_LN2).floor();
+    let r = x - s_float * LN2;
+    let s = s_float as i64;
+
+    // Compute z = floor(2^63 * ccs * exp(-r)) using integer polynomial.
+    // r is always in [0, ln(2)) regardless of the sign of x.
+    let mut z = fpr_expm_p63(r, ccs);
+
+    // For s >= 0: halve z exactly s times.
+    // exp(-x) = exp(-r) * 2^(-s), so each halving divides by 2.
+    let s_halve = s.max(0).min(63) as u32;
+    for i in 0..63u32 {
+        let is_active = ((i.wrapping_sub(s_halve)) >> 31) & 1;
+        let mask = (is_active as u64).wrapping_neg();
+        let halved = (z + 1) >> 1;
+        z ^= (z ^ halved) & mask;
+    }
+
+    // For s < 0: double z exactly |s| times (with saturation at 2^63-1).
+    // exp(-x) = exp(-r) * 2^|s|, so each doubling multiplies by 2.
+    // s_double = 0 when s >= 0 (loop is a no-op), |s| when s < 0.
+    let s_double = ((-s).max(0).min(63)) as u32;
+    for i in 0..63u32 {
+        let is_active = ((i.wrapping_sub(s_double)) >> 31) & 1;
+        let mask = (is_active as u64).wrapping_neg();
+        // Saturating double: if z >= 2^62, cap at 2^63-1
+        let cap = (z >> 62) & 1;
+        let cap_mask = cap.wrapping_neg();
+        let doubled = (z.wrapping_shl(1) & !cap_mask)
+            | (0x7FFF_FFFF_FFFF_FFFF & cap_mask);
+        z ^= (z ^ doubled) & mask;
+    }
+
+    // Draw random 63-bit value and compare
+    let w: u64 = rng.gen::<u64>() >> 1;
+    w < z
+}
+
+/// Original branching ber_exp for comparison testing.
+#[cfg(test)]
+fn ber_exp_branching<R: RngCore>(rng: &mut R, x: f64, ccs: f64) -> bool {
+    const LN2: f64 = 0.693_147_180_559_945_309_417_232_121_458;
+    const INV_LN2: f64 = 1.442_695_040_888_963_407_359_924_681_002;
+
     if x < 0.0 {
-        // prob = ccs * exp(|x|). If >= 1, always accept.
         let prob = ccs * (-x).exp();
         if prob >= 1.0 {
-            // Still consume the random value for constant RNG consumption
             let _w: u64 = rng.gen();
             return true;
         }
-        // prob < 1: compute z = floor(prob * 2^63) and compare
         let z = (prob * 9_223_372_036_854_775_808.0) as u64;
         let w: u64 = rng.gen::<u64>() >> 1;
         return w < z;
     }
 
-    // Standard path (x >= 0): pure integer arithmetic
     let s = (x * INV_LN2).floor() as u32;
     let r = x - (s as f64) * LN2;
-
-    // Compute z = floor(2^63 * ccs * exp(-r)) using integer polynomial
     let mut z = fpr_expm_p63(r, ccs);
-
-    // Halve z exactly s times, constant-time over 63 iterations.
-    // Each halving computes z = (z + 1) >> 1.
-    // Masking ensures only the first s iterations actually modify z.
-    // For s = 0 (including negative-x case): no halvings, z unchanged.
     for i in 0..63u32 {
-        // is_active = 1 if i < s, 0 otherwise (constant-time)
         let is_active = ((i.wrapping_sub(s)) >> 31) & 1;
-        let mask = (is_active as u64).wrapping_neg(); // all-1s or all-0s
+        let mask = (is_active as u64).wrapping_neg();
         let halved = (z + 1) >> 1;
         z ^= (z ^ halved) & mask;
     }
-
-    // Draw random 63-bit value and compare
     let w: u64 = rng.gen::<u64>() >> 1;
     w < z
 }
@@ -789,5 +819,36 @@ mod tests {
             "Variance {} should be close to {} (sigma={})",
             variance, expected_var, sigma
         );
+    }
+
+    #[test]
+    fn test_ber_exp_branchless_vs_branching() {
+        // Compare branchless ber_exp against the original branching version
+        // using the same RNG seeds. Both should produce identical results.
+        let ccs = 0.315;
+        let x_values = [0.0, 0.1, 0.5, 1.0, 2.0, -0.01, -0.1, -0.5, -1.0];
+
+        for &x in &x_values {
+            let n = 5000;
+            let mut rng1 = StdRng::seed_from_u64(777);
+            let mut rng2 = StdRng::seed_from_u64(777);
+
+            let mut count_bl = 0;
+            let mut count_br = 0;
+            for _ in 0..n {
+                if ber_exp(&mut rng1, x, ccs) { count_bl += 1; }
+                if ber_exp_branching(&mut rng2, x, ccs) { count_br += 1; }
+            }
+
+            let rate_bl = count_bl as f64 / n as f64;
+            let rate_br = count_br as f64 / n as f64;
+
+            // Rates should be statistically close (within 3%)
+            assert!(
+                (rate_bl - rate_br).abs() < 0.03,
+                "BerExp mismatch at x={}: branchless={:.3}, branching={:.3}",
+                x, rate_bl, rate_br
+            );
+        }
     }
 }

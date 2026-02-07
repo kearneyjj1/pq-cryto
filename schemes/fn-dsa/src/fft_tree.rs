@@ -24,6 +24,13 @@ pub struct FftNode {
     pub l10: Vec<Complex>,
 }
 
+impl Drop for FftNode {
+    fn drop(&mut self) {
+        self.sigma.zeroize();
+        self.l10.zeroize();
+    }
+}
+
 impl FftNode {
     /// Creates an empty node.
     pub fn empty() -> Self {
@@ -52,6 +59,12 @@ pub struct FftTree {
     /// Tree nodes, organized by level.
     /// Level 0 has 1 node (root), level k has 2^k nodes.
     nodes: Vec<FftNode>,
+}
+
+impl Drop for FftTree {
+    fn drop(&mut self) {
+        self.zeroize_tree();
+    }
 }
 
 impl FftTree {
@@ -270,6 +283,18 @@ impl GramSchmidt {
             sigma_fg,
             sigma_FG,
         }
+    }
+}
+
+impl Drop for GramSchmidt {
+    fn drop(&mut self) {
+        self.f_fft.zeroize();
+        self.g_fft.zeroize();
+        self.big_f_fft.zeroize();
+        self.big_g_fft.zeroize();
+        self.sigma_fg.zeroize();
+        self.sigma_FG.zeroize();
+        // tree's own Drop impl handles zeroization of tree nodes
     }
 }
 

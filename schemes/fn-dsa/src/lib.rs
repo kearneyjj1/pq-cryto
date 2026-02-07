@@ -18,11 +18,19 @@
 //! - [`params::FALCON_512`]: NIST Level 1 (~128-bit security)
 //! - [`params::FALCON_1024`]: NIST Level 5 (~256-bit security)
 //!
+//! ## Platform Requirements
+//!
+//! This implementation requires IEEE 754 double-precision floating-point
+//! with round-to-nearest-even mode for the signing path. On x86/x86_64,
+//! SSE2 is required (default on x86_64, enforced via `compile_error!`).
+//! Signing results may differ across platforms with different FP behavior
+//! (x87 extended precision, FMA instructions).
+//!
 //! ## Security Warning
 //!
 //! This implementation:
-//! - Is NOT constant-time and may leak information through timing
-//! - Uses floating-point arithmetic which may have platform-dependent behavior
+//! - Has partial constant-time protections (BerExp, RCDT, field arithmetic)
+//! - Uses floating-point FFT which requires platform constraints (see above)
 //! - Has NOT been audited by security professionals
 //! - Should NOT be used in production systems
 //!

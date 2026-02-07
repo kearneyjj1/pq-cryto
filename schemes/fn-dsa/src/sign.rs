@@ -83,9 +83,20 @@ impl Signature {
 /// 5. Computes s2 = z0·f + z1·F (see module docs for basis convention)
 /// 6. Derives s1 = c - s2·h and checks ||(s1, s2)|| is within bounds
 /// 7. Returns the signature (nonce, s2)
+///
+/// ## Timing Side-Channels
+///
+/// The outer signing loop (retry on norm failure) and the inner SamplerZ
+/// rejection loop are inherently variable-time. This is a fundamental property
+/// of the FALCON algorithm: the number of signing attempts and rejection
+/// samples are random variables that cannot be made constant without
+/// abandoning the security proof. The reference FALCON implementation has the
+/// same characteristic. Within each iteration, BerExp uses integer arithmetic
+/// and the RCDT base sampler uses constant-time comparison.
 pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     use zeroize::Zeroize;
     use crate::poly::Poly;
+    use crate::field::Zq;
 
     let n = sk.params.n;
     let sigma = sk.params.sigma;
@@ -96,8 +107,8 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     let ff_sampler = FfSampler::new(sk.gs.clone(), sigma, sigma_min);
 
     // Precompute NTT-ready Poly forms of the secret key polynomials
-    let f_poly = Poly::from_i16(&sk.f.iter().map(|&x| x as i16).collect::<Vec<_>>());
-    let big_f_poly = Poly::from_i16(&sk.big_f.iter().map(|&x| x as i16).collect::<Vec<_>>());
+    let mut f_poly = Poly::from_i16(&sk.f.iter().map(|&x| x as i16).collect::<Vec<_>>());
+    let mut big_f_poly = Poly::from_i16(&sk.big_f.iter().map(|&x| x as i16).collect::<Vec<_>>());
     let h_poly = Poly::from_i16(&sk.h);
 
     for _attempt in 0..MAX_SIGN_ATTEMPTS {
@@ -118,8 +129,8 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         // The sampler produces integer polynomials; ifft + round recovers them.
         ifft(&mut z0_fft);
         ifft(&mut z1_fft);
-        let z0: Vec<i16> = z0_fft.iter().map(|c| c.re.round() as i16).collect();
-        let z1: Vec<i16> = z1_fft.iter().map(|c| c.re.round() as i16).collect();
+        let mut z0: Vec<i16> = z0_fft.iter().map(|c| c.re.round() as i16).collect();
+        let mut z1: Vec<i16> = z1_fft.iter().map(|c| c.re.round() as i16).collect();
 
         // Zeroize per-iteration secret intermediates
         c_fft.zeroize();
@@ -135,6 +146,10 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         let s2_poly = z0_poly.mul_ntt(&f_poly).add(&z1_poly.mul_ntt(&big_f_poly));
         let s2 = s2_poly.to_centered();
 
+        // Zeroize sampled lattice vectors (secret-dependent)
+        z0.zeroize();
+        z1.zeroize();
+
         // Compute s1 = c - s2*h using exact NTT arithmetic (same as verification)
         let c_poly = Poly::from_zq(c.clone());
         let s2_for_verify = Poly::from_i16(&s2);
@@ -149,9 +164,16 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
 
         if (total_norm_sq as f64) <= bound_sq {
+            // Zeroize secret-derived polynomial objects before returning
+            for c in &mut f_poly.coeffs { *c = Zq::ZERO; }
+            for c in &mut big_f_poly.coeffs { *c = Zq::ZERO; }
             return Ok(Signature { nonce, s2 });
         }
     }
+
+    // Zeroize secret-derived polynomial objects on error path
+    for c in &mut f_poly.coeffs { *c = Zq::ZERO; }
+    for c in &mut big_f_poly.coeffs { *c = Zq::ZERO; }
 
     Err(FnDsaError::SigningFailed {
         attempts: MAX_SIGN_ATTEMPTS,

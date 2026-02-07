@@ -21,7 +21,35 @@
 //! down to the n=1 leaves. This is essential for ffSampling correctness.
 
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroize;
+
+// Enforce SSE2 on x86/x86_64 for reproducible f64 arithmetic in the signing path.
+// Without SSE2, the x87 FPU uses 80-bit extended precision, producing different
+// FFT results that can cause non-reproducible signing behavior across platforms.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(target_feature = "sse2")
+))]
+compile_error!(
+    "FN-DSA requires SSE2 for reproducible floating-point arithmetic in the signing path. \
+     Compile with RUSTFLAGS=\"-C target-feature=+sse2\" or target an x86_64 platform."
+);
+
+/// Verifies that the floating-point environment uses IEEE 754 round-to-nearest-even,
+/// which is required for FALCON's FFT arithmetic to produce consistent results.
+/// Only asserts in debug builds; compiles to nothing in release.
+fn assert_fp_rounding_mode() {
+    // In round-to-nearest-even, 1.0 + epsilon/2 rounds to 1.0 (ties go to even).
+    // In round-up mode this would produce 1.0 + epsilon instead.
+    debug_assert_eq!(
+        1.0f64 + f64::EPSILON / 2.0,
+        1.0f64,
+        "Floating-point rounding mode is not round-to-nearest-even. \
+         FN-DSA requires IEEE 754 default rounding for correct signing."
+    );
+}
 
 /// A complex number with f64 components.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -246,6 +274,26 @@ pub fn compute_roots(n: usize) -> Vec<Complex> {
     current
 }
 
+/// Cached root tables for all power-of-2 sizes from 2 to 1024.
+/// Computed once on first access, then reused for all subsequent calls.
+static ROOT_CACHE: OnceLock<Vec<Vec<Complex>>> = OnceLock::new();
+
+/// Returns a reference to the precomputed roots for the given size `n`.
+///
+/// On the first call, computes root tables for all sizes 2, 4, 8, ..., 1024.
+/// All subsequent calls return cached references with zero computation cost.
+/// This eliminates the O(n) trig cost that previously occurred on every
+/// `fft()`, `ifft()`, `split_fft()`, and `merge_fft()` call.
+fn get_roots(n: usize) -> &'static [Complex] {
+    debug_assert!(n.is_power_of_two() && n >= 2 && n <= 1024);
+    let tables = ROOT_CACHE.get_or_init(|| {
+        let max_log = 10; // 2^10 = 1024
+        (0..max_log).map(|i| compute_roots(2 << i)).collect()
+    });
+    // n=2 -> trailing_zeros=1 -> index 0; n=1024 -> trailing_zeros=10 -> index 9
+    &tables[n.trailing_zeros() as usize - 1]
+}
+
 // ============================================================================
 // FFT Operations (Falcon recursive form)
 // ============================================================================
@@ -257,13 +305,20 @@ pub fn compute_roots(n: usize) -> Vec<Complex> {
 /// adjacent entries (2i, 2i+1) are always conjugate pairs for real inputs.
 /// This property is essential for ffSampling to produce correct signatures.
 pub fn fft(a: &mut [Complex]) {
+    // One-time FP rounding mode verification (debug builds only)
+    static FP_CHECKED: AtomicBool = AtomicBool::new(false);
+    if !FP_CHECKED.load(Ordering::Relaxed) {
+        assert_fp_rounding_mode();
+        FP_CHECKED.store(true, Ordering::Relaxed);
+    }
+
     let n = a.len();
     if n <= 1 {
         return;
     }
     debug_assert!(n.is_power_of_two(), "FFT size must be power of 2");
-    let roots = compute_roots(n);
-    let result = fft_recursive(a, &roots, n);
+    let roots = get_roots(n);
+    let result = fft_recursive(a, roots, n);
     a.copy_from_slice(&result);
 }
 
@@ -290,15 +345,11 @@ fn fft_recursive(coeffs: &[Complex], roots: &[Complex], n: usize) -> Vec<Complex
         odd[i] = coeffs[2 * i + 1];
     }
 
-    // Build child root tables
-    let mut child_roots = vec![Complex::ZERO; hn];
-    for i in 0..hn {
-        // Child roots are the squares of the parent roots (at even indices)
-        child_roots[i] = roots[2 * i] * roots[2 * i];
-    }
+    // Child roots from cache: roots_n[2i]^2 = roots_{n/2}[i] by construction
+    let child_roots = get_roots(hn);
 
-    let f0 = fft_recursive(&even, &child_roots, hn);
-    let f1 = fft_recursive(&odd, &child_roots, hn);
+    let f0 = fft_recursive(&even, child_roots, hn);
+    let f1 = fft_recursive(&odd, child_roots, hn);
 
     // Merge: f_fft[2i] = f0[i] + w[2i]*f1[i], f_fft[2i+1] = f0[i] - w[2i]*f1[i]
     let mut result = vec![Complex::ZERO; n];
@@ -321,8 +372,8 @@ pub fn ifft(a: &mut [Complex]) {
         return;
     }
     debug_assert!(n.is_power_of_two(), "IFFT size must be power of 2");
-    let roots = compute_roots(n);
-    let result = ifft_recursive(a, &roots, n);
+    let roots = get_roots(n);
+    let result = ifft_recursive(a, roots, n);
     a.copy_from_slice(&result);
 }
 
@@ -346,14 +397,11 @@ fn ifft_recursive(fft_vals: &[Complex], roots: &[Complex], n: usize) -> Vec<Comp
         f1[i] = ((fft_vals[2 * i] - fft_vals[2 * i + 1]) * roots[2 * i].conj()).scale(0.5);
     }
 
-    // Build child root tables
-    let mut child_roots = vec![Complex::ZERO; hn];
-    for i in 0..hn {
-        child_roots[i] = roots[2 * i] * roots[2 * i];
-    }
+    // Child roots from cache: roots_n[2i]^2 = roots_{n/2}[i] by construction
+    let child_roots = get_roots(hn);
 
-    let even = ifft_recursive(&f0, &child_roots, hn);
-    let odd = ifft_recursive(&f1, &child_roots, hn);
+    let even = ifft_recursive(&f0, child_roots, hn);
+    let odd = ifft_recursive(&f1, child_roots, hn);
 
     // Merge coefficients: interleave even and odd
     let mut result = vec![Complex::ZERO; n];
@@ -383,7 +431,7 @@ pub fn split_fft(f: &[Complex]) -> (Vec<Complex>, Vec<Complex>) {
     let n = f.len();
     let hn = n / 2;
 
-    let roots = compute_roots(n);
+    let roots = get_roots(n);
     let mut f0 = vec![Complex::ZERO; hn];
     let mut f1 = vec![Complex::ZERO; hn];
 
@@ -402,7 +450,7 @@ pub fn merge_fft(f0: &[Complex], f1: &[Complex]) -> Vec<Complex> {
     let hn = f0.len();
     let n = hn * 2;
 
-    let roots = compute_roots(n);
+    let roots = get_roots(n);
     let mut f = vec![Complex::ZERO; n];
 
     for i in 0..hn {
@@ -626,6 +674,41 @@ mod tests {
                 "Poly FFT roundtrip failed at {}",
                 i
             );
+        }
+    }
+
+    #[test]
+    fn test_root_cache_consistency() {
+        // Verify cached roots match freshly computed roots for all sizes
+        for log_n in 1..=10 {
+            let n = 1 << log_n;
+            let cached = get_roots(n);
+            let fresh = compute_roots(n);
+            assert_eq!(cached.len(), fresh.len(), "Length mismatch for n={}", n);
+            for i in 0..n {
+                assert!(
+                    (cached[i].re - fresh[i].re).abs() < 1e-14 &&
+                    (cached[i].im - fresh[i].im).abs() < 1e-14,
+                    "Root mismatch at n={}, i={}: cached={:?} vs fresh={:?}",
+                    n, i, cached[i], fresh[i]
+                );
+            }
+        }
+
+        // Verify parent-child squared-root invariant: roots_n[2i]^2 == roots_{n/2}[i]
+        for log_n in 2..=10 {
+            let n = 1 << log_n;
+            let hn = n / 2;
+            let parent = get_roots(n);
+            let child = get_roots(hn);
+            for i in 0..hn {
+                let squared = parent[2 * i] * parent[2 * i];
+                assert!(
+                    (squared.re - child[i].re).abs() < 1e-12 &&
+                    (squared.im - child[i].im).abs() < 1e-12,
+                    "Parent-child root invariant failed at n={}, i={}", n, i
+                );
+            }
         }
     }
 

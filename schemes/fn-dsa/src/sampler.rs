@@ -51,6 +51,15 @@ pub struct FfSampler {
     sigma_min: f64,
 }
 
+impl Drop for FfSampler {
+    fn drop(&mut self) {
+        // GramSchmidt's own Drop handles zeroization of gs fields.
+        // Clear sigma values as defense-in-depth.
+        self.sigma_sign = 0.0;
+        self.sigma_min = 0.0;
+    }
+}
+
 impl FfSampler {
     /// Creates a new Fast Fourier Sampler.
     pub fn new(gs: GramSchmidt, sigma_sign: f64, sigma_min: f64) -> Self {
@@ -125,16 +134,13 @@ impl FfSampler {
             // Cap sigma_eff at 4*sigma_min to ensure ccs >= 0.25 (~4 trials avg).
             // This cap never triggers for properly conditioned FALCON keys.
             let max_sigma_eff = 4.0 * self.sigma_min;
-            let sigma_1 = if node.sigma[1] > 1e-6 {
-                (self.sigma_sign / node.sigma[1]).clamp(self.sigma_min, max_sigma_eff)
-            } else {
-                self.sigma_min * 1.5
-            };
-            let sigma_0 = if node.sigma[0] > 1e-6 {
-                (self.sigma_sign / node.sigma[0]).clamp(self.sigma_min, max_sigma_eff)
-            } else {
-                self.sigma_min * 1.5
-            };
+            // Branchless sigma computation: .max(1e-300) prevents div-by-zero
+            // for degenerate tree nodes, and .clamp() bounds the result.
+            // For well-conditioned FALCON keys, node.sigma[i] >> 1e-300 always.
+            let sigma_1 = (self.sigma_sign / node.sigma[1].max(1e-300))
+                .clamp(self.sigma_min, max_sigma_eff);
+            let sigma_0 = (self.sigma_sign / node.sigma[0].max(1e-300))
+                .clamp(self.sigma_min, max_sigma_eff);
             let l10_val = node.l10[0];
 
             // Sample z1 (real part only).
