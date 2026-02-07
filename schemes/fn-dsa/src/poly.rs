@@ -6,6 +6,7 @@
 use crate::fft::{fft, fft_add, fft_mul, fft_sub, ifft, Complex};
 use crate::field::Zq;
 use crate::params::Q;
+use zeroize::Zeroize;
 
 /// A polynomial in Z_q[X]/(X^n + 1).
 ///
@@ -14,6 +15,12 @@ use crate::params::Q;
 pub struct Poly {
     /// Polynomial coefficients in [0, q-1].
     pub coeffs: Vec<Zq>,
+}
+
+impl Drop for Poly {
+    fn drop(&mut self) {
+        self.coeffs.zeroize();
+    }
 }
 
 impl Poly {
@@ -229,6 +236,12 @@ pub struct PolyFft {
     pub coeffs: Vec<Complex>,
 }
 
+impl Drop for PolyFft {
+    fn drop(&mut self) {
+        self.coeffs.zeroize();
+    }
+}
+
 impl PolyFft {
     /// Creates a zero polynomial in FFT form.
     pub fn zero(n: usize) -> Self {
@@ -378,7 +391,9 @@ fn find_primitive_root(n: usize) -> Zq {
         Q - 1
     );
 
-    // 11 is a known primitive root mod 12289
+    // 11 is a known primitive root mod 12289 (order = q-1 = 12288).
+    // Verified: 11^((q-1)/p) != 1 for each prime factor p of 12288 = 2^12 * 3.
+    // Uses pow (not pow_ct) because the exponent (q-1)/n is public.
     let g = Zq::new(11);
     let exp = (Q - 1) as u32 / (n as u32);
     g.pow(exp)

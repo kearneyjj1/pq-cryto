@@ -6,11 +6,12 @@
 
 use crate::params::Q;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use zeroize::Zeroize;
 
 /// An element of Z_q where q = 12289.
 ///
 /// Values are stored in the range [0, q-1].
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Zeroize)]
 pub struct Zq(pub i16);
 
 impl Zq {
@@ -30,6 +31,7 @@ impl Zq {
     /// The caller must ensure the value is already in [0, q-1].
     #[inline]
     pub const fn from_i16_unchecked(val: i16) -> Self {
+        debug_assert!(val >= 0 && (val as i32) < Q);
         Zq(val)
     }
 
@@ -59,6 +61,9 @@ impl Zq {
     }
 
     /// Computes self^exp using binary exponentiation.
+    ///
+    /// **Not constant-time** with respect to the exponent: branches on
+    /// exponent bits. Use `pow_ct` when the exponent is secret.
     pub fn pow(self, mut exp: u32) -> Self {
         if exp == 0 {
             return Zq::ONE;
@@ -78,13 +83,35 @@ impl Zq {
         result
     }
 
+    /// Constant-time modular exponentiation.
+    ///
+    /// Always performs the multiply at every bit position and uses a
+    /// branchless select to keep or discard the result. Safe for secret
+    /// exponents.
+    pub fn pow_ct(self, exp: u32) -> Self {
+        let mut base = self;
+        let mut result = Zq::ONE;
+
+        for i in 0..32u32 {
+            let product = result * base;
+            let bit = ((exp >> i) & 1) as i16;
+            // mask = 0xFFFF if bit=1, 0x0000 if bit=0
+            let mask = bit.wrapping_neg();
+            result = Zq((product.0 & mask) | (result.0 & !mask));
+            base = base.square();
+        }
+
+        result
+    }
+
     /// Computes the multiplicative inverse using Fermat's little theorem.
     ///
     /// For prime q, a^(-1) = a^(q-2) mod q.
     /// Returns 0 for input 0 (undefined, but safe).
+    /// Uses constant-time exponentiation.
     #[inline]
     pub fn inverse(self) -> Self {
-        self.pow((Q - 2) as u32)
+        self.pow_ct((Q - 2) as u32)
     }
 
     /// Returns the centered representation in [-(q-1)/2, (q-1)/2].
@@ -123,7 +150,7 @@ pub fn reduce64(val: i64) -> i16 {
     let q = Q as i64;
     let mut r = val % q;
     // Branchless: if r < 0, add q
-    let neg_mask = (r >> 63) as i64; // all-1s if r < 0
+    let neg_mask = r >> 63; // all-1s if r < 0
     r += q & neg_mask;
     r as i16
 }
@@ -174,20 +201,24 @@ impl Mul for Zq {
     type Output = Zq;
 
     /// Constant-time modular multiplication using Barrett reduction.
+    ///
+    /// Barrett constant M = floor(2^28 / Q) = 21843. The shift width 28 is
+    /// chosen so that (Q-1)^2 * M = 12288^2 * 21843 ≈ 3.3e12 fits in i64.
+    /// The approximation q_approx underestimates floor(prod/Q) by at most 1,
+    /// so the remainder r = prod - q_approx*Q lies in [0, 2Q-1]. One
+    /// branchless correction handles the case r >= Q.
     #[inline]
     fn mul(self, rhs: Zq) -> Zq {
         let prod = self.0 as i32 * rhs.0 as i32;
         // Both inputs in [0, Q-1], so prod in [0, (Q-1)^2 = ~1.51e8].
-        // Barrett reduction: M = floor(2^28 / Q) = 21843
-        // q_approx = (prod * M) >> 28
-        // r = prod - q_approx * Q
-        // r may be off by at most Q, so one branchless correction.
-        const BARRETT_M: i64 = 21843;
+        const BARRETT_M: i64 = 21843; // floor(2^28 / 12289)
         let q_approx = ((prod as i64 * BARRETT_M) >> 28) as i32;
         let mut r = prod - q_approx * Q;
-        // Branchless: if r >= Q, subtract Q
+        // Branchless: if r >= Q, subtract Q.
+        // over >= 0 means r >= Q: !(over >> 31) = all-1s, so r -= Q.
+        // over < 0 means r < Q: !(over >> 31) = 0, so r unchanged.
         let over = r - Q;
-        let mask = !(over >> 31); // all-1s if r >= Q
+        let mask = !(over >> 31);
         r -= Q & mask;
         Zq(r as i16)
     }

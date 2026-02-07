@@ -25,8 +25,9 @@ pub const SIGMA_MIN: f64 = 1.277833697;
 /// Computed from SIGMA_0 to ensure internal consistency with the RCDT table.
 const INV_2SIGMA0_SQ: f64 = 1.0 / (2.0 * SIGMA_0 * SIGMA_0);
 
-/// Maximum deviation from the mean (in units of sigma) that we consider.
+/// Maximum deviation from the mean (in units of sigma) for test samplers.
 /// Values beyond this are essentially zero probability.
+#[cfg(test)]
 const MAX_SIGMA_MULT: f64 = 10.0;
 
 // ============================================================================
@@ -97,12 +98,17 @@ pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
 
 /// Samples from a discrete Gaussian N(0, sigma^2) for key generation.
 ///
-/// Uses fixed-iteration rejection sampling with uniform proposal over [-K*sigma, K*sigma].
+/// Uses fixed-iteration rejection sampling with uniform proposal over [-4σ, 4σ].
+/// All iterations consume the same RNG bytes and use branchless integer-based
+/// acceptance to avoid timing side-channels on the sampled value.
 ///
-/// Each coefficient consumes exactly `FIXED_ITERS` iterations to mitigate timing
-/// side-channels: after accepting a sample, remaining iterations draw and discard.
-/// The acceptance rate is ~0.38 for sigma≈4.05, so 32 iterations gives >99.99%
-/// probability of acceptance within the budget.
+/// The acceptance test uses `fpr_expm_p63` (Q63 integer polynomial) instead of
+/// `f64::exp()` to avoid variable-time libm calls. The comparison uses unsigned
+/// integer subtraction instead of floating-point comparison to avoid branches.
+///
+/// The iteration count is computed from the acceptance rate to guarantee failure
+/// probability < 2^-128. Since sigma is derived from the public parameter n,
+/// the iteration count is public and leaks no secret information.
 ///
 /// The FIPS 206 SamplerZ (Algorithm 12) cannot be used for keygen because its
 /// base sampler at sigma_0=1.82 has lighter tails than the target sigma≈4.05,
@@ -113,37 +119,73 @@ pub fn sample_keygen_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
         return 0;
     }
 
-    let max_z = (sigma * MAX_SIGMA_MULT).ceil() as i64;
+    // Defense-in-depth: clamp sigma to a minimum of 0.5 to ensure the
+    // dynamically computed iteration count always achieves < 2^-128 failure.
+    // Keygen sigma is always >= 2.86 (for n=1024), so this never activates.
+    let sigma = sigma.max(0.5);
+
+    // 4σ tail bound: captures 99.994% of the Gaussian mass.
+    // Variance bias from truncation is < 0.11%, negligible for keygen.
+    let max_z = (sigma * 4.0).ceil() as i64;
     let two_sigma_sq = 2.0 * sigma * sigma;
+    let range = (2 * max_z + 1) as u64;
 
-    // Fixed iteration count to pad all coefficient samplings to uniform time.
-    // With acceptance rate ~0.38, probability of no acceptance in 32 trials < 2^-40.
-    const FIXED_ITERS: u32 = 32;
+    // Compute iterations for failure probability < 2^-128.
+    // Acceptance rate ≈ sigma * sqrt(2π) / range ≈ 0.29–0.31 for typical keygen sigma.
+    // Iterations = ceil(128 * ln(2) / -ln(1 - rate)).
+    let acceptance_rate = (sigma * std::f64::consts::TAU.sqrt() / range as f64).min(0.99);
+    let fixed_iters = (128.0_f64 * 2.0_f64.ln() / -(1.0 - acceptance_rate).ln())
+        .ceil() as u32;
+    let fixed_iters = fixed_iters.max(64);
+
+    // Constants for decomposing x = s*ln(2) + r
+    const LN2: f64 = 0.693_147_180_559_945_309_417_232_121_458;
+    const INV_LN2: f64 = 1.442_695_040_888_963_407_359_924_681_002;
+
     let mut result = 0i64;
-    let mut accepted = false;
+    let mut accepted = 0u64; // 0 = not yet, 1 = accepted
 
-    for _ in 0..FIXED_ITERS {
-        let z = rng.gen_range(-max_z..=max_z);
-        let prob = (-((z * z) as f64) / two_sigma_sq).exp();
-        let u: f64 = rng.gen();
-        if u < prob && !accepted {
-            result = z;
-            accepted = true;
+    for _ in 0..fixed_iters {
+        // Constant-time uniform in [-max_z, max_z] via modular reduction.
+        // Bias from u64 % range is < range / 2^64, negligible.
+        let raw: u64 = rng.next_u64();
+        let z = (raw % range) as i64 - max_z;
+
+        // Integer-based acceptance: compute exp(-z^2/(2*sigma^2)) using Q63
+        // polynomial, avoiding variable-time f64::exp() and float branches.
+        // Decompose x = z^2/(2*sigma^2) into s*ln(2) + r, r in [0, ln(2)).
+        let x = ((z * z) as f64) / two_sigma_sq;
+        let s = (x * INV_LN2).floor() as u32;
+        let r = x - (s as f64) * LN2;
+
+        // z_q63 = floor(2^63 * exp(-r)) via integer polynomial
+        let mut z_q63 = fpr_expm_p63(r, 1.0);
+
+        // Branchless halving s times: z_q63 *= 2^(-s)
+        // For keygen with 4σ tail, x <= 8 so s <= 12 — well within 63.
+        let s_halve = s.min(63);
+        for i in 0..63u32 {
+            let is_active = ((i.wrapping_sub(s_halve)) >> 31) & 1;
+            let mask = (is_active as u64).wrapping_neg();
+            let halved = (z_q63 + 1) >> 1;
+            z_q63 ^= (z_q63 ^ halved) & mask;
         }
+
+        // Draw 63 random bits and accept via integer comparison (constant-time).
+        // Unsigned subtraction: high bit set iff w < z_q63 (borrow).
+        let w = rng.next_u64() >> 1;
+        let accept = (w.wrapping_sub(z_q63)) >> 63; // 1 if w < z_q63
+
+        let first_accept = accept & (1 - accepted);
+        // Branchless select: update result only on first acceptance
+        let mask = first_accept.wrapping_neg() as i64; // 0 or -1 (all-ones)
+        result = (z & mask) | (result & !mask);
+        accepted |= accept;
     }
 
-    // Fallback (statistically near-impossible: probability < 2^-40)
-    if !accepted {
-        loop {
-            let z = rng.gen_range(-max_z..=max_z);
-            let prob = (-((z * z) as f64) / two_sigma_sq).exp();
-            let u: f64 = rng.gen();
-            if u < prob {
-                return z;
-            }
-        }
-    }
-
+    // Statistically unreachable: sigma >= 0.5 guarantees enough iterations
+    // for < 2^-128 failure probability.
+    assert!(accepted != 0, "keygen Gaussian sampling failed after {} iterations", fixed_iters);
     result
 }
 
@@ -512,6 +554,10 @@ impl SamplerZ {
         let dss = 1.0 / (2.0 * sigma * sigma);
         let ccs = self.sigma_min / sigma;
 
+        // Note: this rejection loop is inherently variable-time (iteration count
+        // depends on secret mu/sigma). This is fundamental to FALCON's design —
+        // the reference implementation has the same property. The number of loop
+        // iterations is considered public information in the security model.
         loop {
             // 1. Sample z0 >= 0 from half-Gaussian at sigma_0
             let z0 = self.base.sample_half(rng);
@@ -540,8 +586,9 @@ impl SamplerZ {
             let z_nonzero = ((z as u64) | (z as u64).wrapping_neg()) >> 63;
             let valid = z_nonzero | (b as u64);
 
-            // Accept iff BerExp accepted AND (z,b) is not the forbidden (0,0) case
-            if accept_ber && valid != 0 {
+            // Accept iff BerExp accepted AND (z,b) is not the forbidden (0,0) case.
+            // Use bitwise & (not short-circuit &&) to avoid timing leak on accept_ber.
+            if accept_ber & (valid != 0) {
                 return s + z;
             }
         }

@@ -127,20 +127,43 @@ impl Complex {
         }
     }
 
-    /// Computes the multiplicative inverse 1/z using Smith's algorithm.
+    /// Computes the multiplicative inverse 1/z using branchless Smith's algorithm.
     ///
     /// Avoids computing `re^2 + im^2` which can overflow or underflow for
-    /// extreme magnitudes. Instead divides through by the larger component.
+    /// extreme magnitudes. Both Smith's paths are computed unconditionally and
+    /// the correct result is selected via IEEE 754 bit manipulation, avoiding
+    /// data-dependent branches that could leak information about secret FFT
+    /// coefficients through timing side-channels.
     #[inline]
     pub fn inverse(self) -> Self {
-        if self.re.abs() >= self.im.abs() {
-            let r = self.im / self.re;
-            let d = self.re + self.im * r;
-            Complex { re: 1.0 / d, im: -r / d }
-        } else {
-            let r = self.re / self.im;
-            let d = self.im + self.re * r;
-            Complex { re: r / d, im: -1.0 / d }
+        let a = self.re;
+        let b = self.im;
+
+        // Path 1 (|a| >= |b|): r = b/a, d = a + b*r
+        let r1 = b / a;
+        let d1 = a + b * r1;
+        let re1 = 1.0 / d1;
+        let im1 = -r1 / d1;
+
+        // Path 2 (|a| < |b|): r = a/b, d = b + a*r
+        let r2 = a / b;
+        let d2 = b + a * r2;
+        let re2 = r2 / d2;
+        let im2 = -1.0 / d2;
+
+        // Branchless select via IEEE 754 bit manipulation.
+        // For non-negative f64, the unsigned bit representation preserves order.
+        // The invalid path may produce NaN/inf, but SSE2 handles these without
+        // traps and the result is masked out by the select.
+        let abs_a_bits = a.abs().to_bits();
+        let abs_b_bits = b.abs().to_bits();
+        // ge = 1 if |a| >= |b| (unsigned subtraction: borrow iff abs_b > abs_a)
+        let ge = (abs_b_bits.wrapping_sub(abs_a_bits).wrapping_sub(1)) >> 63;
+        let mask = ge.wrapping_neg(); // all-1s if |a| >= |b|, 0 otherwise
+
+        Complex {
+            re: f64::from_bits((re1.to_bits() & mask) | (re2.to_bits() & !mask)),
+            im: f64::from_bits((im1.to_bits() & mask) | (im2.to_bits() & !mask)),
         }
     }
 
@@ -281,7 +304,8 @@ pub fn compute_roots(n: usize) -> Vec<Complex> {
 }
 
 /// Cached root tables for all power-of-2 sizes from 2 to 1024.
-/// Computed once on first access, then reused for all subsequent calls.
+/// The upper bound of 1024 matches the maximum FALCON polynomial degree
+/// (FALCON-1024 uses n=1024). Computed once on first access.
 static ROOT_CACHE: OnceLock<Vec<Vec<Complex>>> = OnceLock::new();
 
 /// Returns a reference to the precomputed roots for the given size `n`.
@@ -489,10 +513,15 @@ pub fn poly_to_fft(coeffs: &[i16], n: usize) -> Vec<Complex> {
 }
 
 /// Converts from FFT form back to (approximate) integer coefficients.
+///
+/// Clamps values to the i16 range to prevent undefined truncation.
 pub fn fft_to_poly(fft_coeffs: &[Complex]) -> Vec<i16> {
     let mut f = fft_coeffs.to_vec();
     ifft(&mut f);
-    f.iter().map(|c| c.re.round() as i16).collect()
+    f.iter().map(|c| {
+        let rounded = c.re.round();
+        rounded.clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    }).collect()
 }
 
 /// Multiplies two polynomials in FFT form (pointwise).
@@ -520,19 +549,11 @@ pub fn fft_neg(a: &[Complex]) -> Vec<Complex> {
 
 /// Computes the adjoint (conjugate) of a polynomial in FFT form.
 ///
-/// In the Falcon tree ordering, the adjoint permutation maps
-/// index i to the index evaluating at the conjugate root.
-/// Since w[i+n/2] = conj(w[i]), swapping the two halves with
-/// conjugation gives the adjoint.
+/// In the Falcon tree ordering, the adjoint is element-wise complex
+/// conjugation. This matches the property that for a real polynomial f,
+/// evaluating f*(x) = f(1/x) * x^n at root w_i gives conj(f(w_i)).
 pub fn fft_adj(a: &[Complex]) -> Vec<Complex> {
-    let n = a.len();
-    let hn = n / 2;
-    let mut result = vec![Complex::ZERO; n];
-    for i in 0..hn {
-        result[i] = a[i + hn].conj();
-        result[i + hn] = a[i].conj();
-    }
-    result
+    a.iter().map(|c| c.conj()).collect()
 }
 
 #[cfg(test)]

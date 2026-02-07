@@ -14,6 +14,7 @@ use crate::fft_tree::GramSchmidt;
 use crate::keygen::{KeyPair, PublicKey, SecretKey};
 use crate::params::{FALCON_512, FALCON_1024, NONCE_SIZE};
 use crate::sign::Signature;
+use zeroize::Zeroizing;
 
 // ============================================================================
 // Constants
@@ -135,7 +136,9 @@ pub fn decode_public_key(bytes: &[u8]) -> Result<PublicKey> {
 /// - n * 2 bytes: G coefficients (little-endian i16)
 ///
 /// Note: The Gram-Schmidt data is recomputed on decode rather than stored.
-pub fn encode_secret_key(sk: &SecretKey) -> Vec<u8> {
+/// Returns a `Zeroizing<Vec<u8>>` that will be automatically zeroized on drop,
+/// preventing secret key material from lingering in memory.
+pub fn encode_secret_key(sk: &SecretKey) -> Zeroizing<Vec<u8>> {
     let n = sk.params.n;
     let mut bytes = Vec::with_capacity(4 + 2 + n + n + n * 2 + n * 2);
 
@@ -165,7 +168,7 @@ pub fn encode_secret_key(sk: &SecretKey) -> Vec<u8> {
         bytes.extend_from_slice(&coeff.to_le_bytes());
     }
 
-    bytes
+    Zeroizing::new(bytes)
 }
 
 /// Decodes a secret key from bytes.
@@ -286,7 +289,9 @@ fn compute_gram_schmidt(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]) -> Gra
 /// - 1 byte: header = 0x30 + log2(n) (0x39 for FALCON-512, 0x3A for FALCON-1024)
 /// - 40 bytes: nonce
 /// - variable: Golomb-Rice compressed s2 coefficients
-pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
+///
+/// Returns an error if the encoded signature exceeds `sig_bytes_max` bytes.
+pub fn encode_signature(sig: &Signature, n: usize, sig_bytes_max: usize) -> Result<Vec<u8>> {
     let log_n = n.trailing_zeros() as u8;
     let header = 0x30 + log_n;
     let k = rice_k_for_n(n);
@@ -328,6 +333,9 @@ pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
                 bit_count -= 8;
             }
 
+            // Invariant: bit_count < 8 after flush, so buffer has room for unary bits
+            debug_assert!(bit_count < 8, "bit_count {} >= 8 before unary encoding", bit_count);
+
             for _ in 0..high {
                 bit_count += 1;
                 if bit_count >= 8 {
@@ -351,7 +359,14 @@ pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
         bytes.push((bit_buffer & 0xFF) as u8);
     }
 
-    bytes
+    if bytes.len() > sig_bytes_max {
+        return Err(FnDsaError::InvalidInput {
+            field: "signature",
+            reason: "encoded signature exceeds sig_bytes_max",
+        });
+    }
+
+    Ok(bytes)
 }
 
 /// Encodes a signature to bytes using the legacy raw format.
@@ -435,6 +450,9 @@ pub fn encode_signature_compressed(sig: &Signature, n: usize) -> Vec<u8> {
                 bit_buffer >>= 8;
                 bit_count -= 8;
             }
+
+            // Invariant: bit_count < 8 after flush
+            debug_assert!(bit_count < 8, "bit_count {} >= 8 before unary encoding", bit_count);
 
             // Unary: high zeros followed by a 1.
             // Emit one bit at a time, flushing as needed, to handle
@@ -645,8 +663,16 @@ fn decode_signature_fips206(bytes: &[u8], n: usize) -> Result<(Signature, usize)
             }
         }
 
-        let abs_val = ((high << k) | low) as i16 + 1;
-        if abs_val > max_coeff || abs_val < 0 {
+        // Check u64 magnitude before casting to i16 to prevent silent truncation
+        let combined = (high << k) | low;
+        if combined >= i16::MAX as u64 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient exceeds i16 range",
+            });
+        }
+        let abs_val = (combined as i16) + 1;
+        if abs_val > max_coeff {
             return Err(FnDsaError::InvalidInput {
                 field: "signature",
                 reason: "s2 coefficient out of range",
@@ -755,8 +781,16 @@ fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usi
             }
         }
 
-        let abs_val = ((high << k) | low) as i16 + 1;
-        if abs_val > max_coeff || abs_val < 0 {
+        // Check u64 magnitude before casting to i16 to prevent silent truncation
+        let combined = (high << k) | low;
+        if combined >= i16::MAX as u64 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient exceeds i16 range",
+            });
+        }
+        let abs_val = (combined as i16) + 1;
+        if abs_val > max_coeff {
             return Err(FnDsaError::InvalidInput {
                 field: "signature",
                 reason: "s2 coefficient out of range",
@@ -868,7 +902,7 @@ mod tests {
             s2: (0..512).map(|i| (i % 200) as i16 - 100).collect(),
         };
 
-        let encoded = encode_signature(&sig, 512);
+        let encoded = encode_signature(&sig, 512, 809).unwrap();
         assert_eq!(encoded[0], 0x39, "FIPS 206 header for FALCON-512");
         let (decoded, n) = decode_signature(&encoded).unwrap();
 
@@ -899,7 +933,7 @@ mod tests {
         assert_eq!(sig.s2, decoded.s2);
 
         // FIPS 206 format should be smaller than legacy raw
-        let fips = encode_signature(&sig, 512);
+        let fips = encode_signature(&sig, 512, 809).unwrap();
         let raw = encode_signature_raw(&sig, 512);
         assert!(
             fips.len() < raw.len(),
@@ -917,7 +951,7 @@ mod tests {
             s2: vec![0i16; 512],
         };
 
-        let encoded = encode_signature(&sig, 512);
+        let encoded = encode_signature(&sig, 512, 809).unwrap();
         let (decoded, n) = decode_signature(&encoded).unwrap();
 
         assert_eq!(n, 512);
@@ -946,7 +980,7 @@ mod tests {
                 .collect(),
         };
 
-        let encoded = encode_signature(&sig, 512);
+        let encoded = encode_signature(&sig, 512, 809).unwrap();
         let (decoded, _) = decode_signature(&encoded).unwrap();
         assert_eq!(sig.s2, decoded.s2);
 
