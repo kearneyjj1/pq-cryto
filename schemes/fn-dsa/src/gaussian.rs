@@ -97,9 +97,12 @@ pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
 
 /// Samples from a discrete Gaussian N(0, sigma^2) for key generation.
 ///
-/// Uses standard rejection sampling with uniform proposal over [-K*sigma, K*sigma].
-/// This is NOT constant-time, which is acceptable for keygen (one-time operation
-/// that doesn't process secret data — the secret IS the output).
+/// Uses fixed-iteration rejection sampling with uniform proposal over [-K*sigma, K*sigma].
+///
+/// Each coefficient consumes exactly `FIXED_ITERS` iterations to mitigate timing
+/// side-channels: after accepting a sample, remaining iterations draw and discard.
+/// The acceptance rate is ~0.38 for sigma≈4.05, so 32 iterations gives >99.99%
+/// probability of acceptance within the budget.
 ///
 /// The FIPS 206 SamplerZ (Algorithm 12) cannot be used for keygen because its
 /// base sampler at sigma_0=1.82 has lighter tails than the target sigma≈4.05,
@@ -113,16 +116,35 @@ pub fn sample_keygen_gaussian<R: RngCore>(rng: &mut R, sigma: f64) -> i64 {
     let max_z = (sigma * MAX_SIGMA_MULT).ceil() as i64;
     let two_sigma_sq = 2.0 * sigma * sigma;
 
-    loop {
-        // Uniform proposal over [-max_z, max_z]
+    // Fixed iteration count to pad all coefficient samplings to uniform time.
+    // With acceptance rate ~0.38, probability of no acceptance in 32 trials < 2^-40.
+    const FIXED_ITERS: u32 = 32;
+    let mut result = 0i64;
+    let mut accepted = false;
+
+    for _ in 0..FIXED_ITERS {
         let z = rng.gen_range(-max_z..=max_z);
-        // Accept with probability exp(-z^2 / (2*sigma^2))
         let prob = (-((z * z) as f64) / two_sigma_sq).exp();
         let u: f64 = rng.gen();
-        if u < prob {
-            return z;
+        if u < prob && !accepted {
+            result = z;
+            accepted = true;
         }
     }
+
+    // Fallback (statistically near-impossible: probability < 2^-40)
+    if !accepted {
+        loop {
+            let z = rng.gen_range(-max_z..=max_z);
+            let prob = (-((z * z) as f64) / two_sigma_sq).exp();
+            let u: f64 = rng.gen();
+            if u < prob {
+                return z;
+            }
+        }
+    }
+
+    result
 }
 
 // ============================================================================

@@ -40,9 +40,10 @@ use zeroize::Zeroize;
 /// Implements the recursive FFT-domain lattice sampling algorithm.
 /// Uses the LDL* tree to decompose the n-dimensional Gaussian sampling
 /// into independent 1D problems at the leaves, with conditioning at each level.
-pub struct FfSampler {
-    /// The Gram-Schmidt / LDL* tree data for the secret key.
-    gs: GramSchmidt,
+pub struct FfSampler<'a> {
+    /// Borrowed reference to the Gram-Schmidt / LDL* tree data.
+    /// Avoids cloning secret key material on every signing call.
+    gs: &'a GramSchmidt,
     /// The FIPS 206 integer Gaussian sampler.
     sampler_z: SamplerZ,
     /// The signing sigma parameter (sigma_sign).
@@ -51,18 +52,18 @@ pub struct FfSampler {
     sigma_min: f64,
 }
 
-impl Drop for FfSampler {
+impl Drop for FfSampler<'_> {
     fn drop(&mut self) {
-        // GramSchmidt's own Drop handles zeroization of gs fields.
         // Clear sigma values as defense-in-depth.
+        // GramSchmidt is borrowed, not owned — its Drop runs with SecretKey.
         self.sigma_sign = 0.0;
         self.sigma_min = 0.0;
     }
 }
 
-impl FfSampler {
-    /// Creates a new Fast Fourier Sampler.
-    pub fn new(gs: GramSchmidt, sigma_sign: f64, sigma_min: f64) -> Self {
+impl<'a> FfSampler<'a> {
+    /// Creates a new Fast Fourier Sampler borrowing the Gram-Schmidt data.
+    pub fn new(gs: &'a GramSchmidt, sigma_sign: f64, sigma_min: f64) -> Self {
         FfSampler {
             gs,
             sampler_z: SamplerZ::with_sigma_min(sigma_min),

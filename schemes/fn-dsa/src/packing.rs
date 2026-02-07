@@ -280,26 +280,94 @@ fn compute_gram_schmidt(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]) -> Gra
 // Signature Encoding
 // ============================================================================
 
-/// Encodes a signature to bytes.
+/// Encodes a signature to bytes using FIPS 206 wire format.
+///
+/// Format:
+/// - 1 byte: header = 0x30 + log2(n) (0x39 for FALCON-512, 0x3A for FALCON-1024)
+/// - 40 bytes: nonce
+/// - variable: Golomb-Rice compressed s2 coefficients
+pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
+    let log_n = n.trailing_zeros() as u8;
+    let header = 0x30 + log_n;
+    let k = rice_k_for_n(n);
+    let k_mask = (1u64 << k) - 1;
+
+    let mut bytes = Vec::with_capacity(1 + NONCE_SIZE + n);
+
+    // FIPS 206 header byte
+    bytes.push(header);
+
+    // Nonce
+    bytes.extend_from_slice(&sig.nonce);
+
+    // Golomb-Rice compressed s2
+    let mut bit_buffer: u64 = 0;
+    let mut bit_count: usize = 0;
+
+    for &coeff in &sig.s2 {
+        if coeff == 0 {
+            bit_count += 1;
+        } else {
+            bit_buffer |= 1u64 << bit_count;
+            bit_count += 1;
+
+            let sign = if coeff < 0 { 1u64 } else { 0u64 };
+            bit_buffer |= sign << bit_count;
+            bit_count += 1;
+
+            let m = (coeff.unsigned_abs() - 1) as u64;
+            let low = m & k_mask;
+            let high = m >> k;
+
+            bit_buffer |= low << bit_count;
+            bit_count += k;
+
+            while bit_count >= 8 {
+                bytes.push((bit_buffer & 0xFF) as u8);
+                bit_buffer >>= 8;
+                bit_count -= 8;
+            }
+
+            for _ in 0..high {
+                bit_count += 1;
+                if bit_count >= 8 {
+                    bytes.push((bit_buffer & 0xFF) as u8);
+                    bit_buffer >>= 8;
+                    bit_count -= 8;
+                }
+            }
+            bit_buffer |= 1u64 << bit_count;
+            bit_count += 1;
+        }
+
+        while bit_count >= 8 {
+            bytes.push((bit_buffer & 0xFF) as u8);
+            bit_buffer >>= 8;
+            bit_count -= 8;
+        }
+    }
+
+    if bit_count > 0 {
+        bytes.push((bit_buffer & 0xFF) as u8);
+    }
+
+    bytes
+}
+
+/// Encodes a signature to bytes using the legacy raw format.
 ///
 /// Format:
 /// - 4 bytes: magic "FSG1"
 /// - 2 bytes: n (little-endian)
 /// - 40 bytes: nonce
 /// - n * 2 bytes: s2 coefficients (little-endian i16)
-pub fn encode_signature(sig: &Signature, n: usize) -> Vec<u8> {
+pub fn encode_signature_raw(sig: &Signature, n: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + 2 + NONCE_SIZE + n * 2);
 
-    // Magic
     bytes.extend_from_slice(&SIG_MAGIC);
-
-    // n
     bytes.extend_from_slice(&(n as u16).to_le_bytes());
-
-    // Nonce
     bytes.extend_from_slice(&sig.nonce);
 
-    // s2 coefficients
     for &coeff in &sig.s2 {
         bytes.extend_from_slice(&coeff.to_le_bytes());
     }
@@ -410,7 +478,28 @@ fn rice_k_for_n(n: usize) -> usize {
 }
 
 /// Decodes a signature from bytes.
+///
+/// Accepts three formats:
+/// - FIPS 206: header byte `0x30 + log2(n)` + nonce + Golomb-Rice compressed s2
+/// - Legacy compressed: magic "FSC1" + n + nonce + Golomb-Rice compressed s2
+/// - Legacy raw: magic "FSG1" + n + nonce + raw i16 s2
 pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
+    if bytes.is_empty() {
+        return Err(FnDsaError::InvalidInput {
+            field: "signature",
+            reason: "too short",
+        });
+    }
+
+    // Check for FIPS 206 header byte: 0x39 (FALCON-512) or 0x3A (FALCON-1024)
+    let header = bytes[0];
+    if header == 0x39 || header == 0x3A {
+        let log_n = (header - 0x30) as usize;
+        let n = 1 << log_n;
+        return decode_signature_fips206(bytes, n);
+    }
+
+    // Legacy format: need at least 6 bytes for magic + n
     if bytes.len() < 6 {
         return Err(FnDsaError::InvalidInput {
             field: "signature",
@@ -418,25 +507,23 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
         });
     }
 
-    // Check magic
     let magic = &bytes[0..4];
     let compressed = magic == b"FSC1";
 
     if magic != &SIG_MAGIC && !compressed {
         return Err(FnDsaError::InvalidInput {
             field: "signature",
-            reason: "invalid magic bytes",
+            reason: "invalid signature header",
         });
     }
 
-    // Read n
     let n = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
 
     if compressed {
         return decode_signature_compressed(bytes, n);
     }
 
-    // Check length for uncompressed
+    // Legacy uncompressed
     let expected_len = 6 + NONCE_SIZE + n * 2;
     if bytes.len() < expected_len {
         return Err(FnDsaError::InvalidInput {
@@ -445,11 +532,9 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
         });
     }
 
-    // Read nonce
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&bytes[6..6 + NONCE_SIZE]);
 
-    // Read s2 coefficients
     let mut s2 = Vec::with_capacity(n);
     let s2_offset = 6 + NONCE_SIZE;
     for i in 0..n {
@@ -458,7 +543,6 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
         s2.push(coeff);
     }
 
-    // Validate coefficient range: s2 should be in centered representation [-Q/2, Q/2]
     let max_coeff = (crate::params::Q / 2) as i16;
     for &coeff in &s2 {
         if coeff < -max_coeff || coeff > max_coeff {
@@ -467,6 +551,109 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
                 reason: "s2 coefficient out of range",
             });
         }
+    }
+
+    Ok((Signature { nonce, s2 }, n))
+}
+
+/// Decodes a FIPS 206 format signature (header byte + nonce + Golomb-Rice).
+fn decode_signature_fips206(bytes: &[u8], n: usize) -> Result<(Signature, usize)> {
+    let k = rice_k_for_n(n);
+    let k_mask = (1u64 << k) - 1;
+    let header_len = 1 + NONCE_SIZE;
+
+    if bytes.len() < header_len {
+        return Err(FnDsaError::InvalidInput {
+            field: "signature",
+            reason: "incomplete FIPS 206 signature data",
+        });
+    }
+
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce.copy_from_slice(&bytes[1..1 + NONCE_SIZE]);
+
+    let mut s2 = Vec::with_capacity(n);
+    let data = &bytes[header_len..];
+
+    let mut bit_buffer: u64 = 0;
+    let mut bit_count: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
+        while *bc < need && *bi < data.len() {
+            *buf |= (data[*bi] as u64) << *bc;
+            *bc += 8;
+            *bi += 1;
+        }
+    };
+
+    let max_coeff = (crate::params::Q / 2) as i16;
+
+    for _ in 0..n {
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+        if bit_count < 1 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "truncated FIPS 206 signature data",
+            });
+        }
+        let nonzero = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        if nonzero == 0 {
+            s2.push(0i16);
+            continue;
+        }
+
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
+        if bit_count < 1 + k {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "truncated FIPS 206 signature data",
+            });
+        }
+        let sign = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        let low = bit_buffer & k_mask;
+        bit_buffer >>= k;
+        bit_count -= k;
+
+        let mut high: u64 = 0;
+        loop {
+            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+            if bit_count < 1 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "truncated unary in FIPS 206 signature",
+                });
+            }
+            let bit = bit_buffer & 1;
+            bit_buffer >>= 1;
+            bit_count -= 1;
+            if bit == 1 {
+                break;
+            }
+            high += 1;
+            if high > 64 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "unary overflow in FIPS 206 signature",
+                });
+            }
+        }
+
+        let abs_val = ((high << k) | low) as i16 + 1;
+        if abs_val > max_coeff || abs_val < 0 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient out of range",
+            });
+        }
+        let coeff = if sign == 1 { -abs_val } else { abs_val };
+        s2.push(coeff);
     }
 
     Ok((Signature { nonce, s2 }, n))
@@ -675,17 +862,25 @@ mod tests {
 
     #[test]
     fn test_signature_roundtrip() {
+        // FIPS 206 format (default)
         let sig = Signature {
             nonce: [42u8; NONCE_SIZE],
             s2: (0..512).map(|i| (i % 200) as i16 - 100).collect(),
         };
 
         let encoded = encode_signature(&sig, 512);
+        assert_eq!(encoded[0], 0x39, "FIPS 206 header for FALCON-512");
         let (decoded, n) = decode_signature(&encoded).unwrap();
 
         assert_eq!(n, 512);
         assert_eq!(sig.nonce, decoded.nonce);
         assert_eq!(sig.s2, decoded.s2);
+
+        // Legacy raw format roundtrip
+        let raw = encode_signature_raw(&sig, 512);
+        let (decoded_raw, n_raw) = decode_signature(&raw).unwrap();
+        assert_eq!(n_raw, 512);
+        assert_eq!(sig.s2, decoded_raw.s2);
     }
 
     #[test]
@@ -695,6 +890,7 @@ mod tests {
             s2: (0..512).map(|i| ((i as i16 * 7) % 400) - 200).collect(),
         };
 
+        // Legacy compressed format
         let encoded = encode_signature_compressed(&sig, 512);
         let (decoded, n) = decode_signature(&encoded).unwrap();
 
@@ -702,13 +898,14 @@ mod tests {
         assert_eq!(sig.nonce, decoded.nonce);
         assert_eq!(sig.s2, decoded.s2);
 
-        // Golomb-Rice compressed should be smaller than uncompressed (n*2 bytes for coeffs)
-        let uncompressed = encode_signature(&sig, 512);
+        // FIPS 206 format should be smaller than legacy raw
+        let fips = encode_signature(&sig, 512);
+        let raw = encode_signature_raw(&sig, 512);
         assert!(
-            encoded.len() < uncompressed.len(),
-            "Compressed {} should be smaller than uncompressed {}",
-            encoded.len(),
-            uncompressed.len()
+            fips.len() < raw.len(),
+            "FIPS 206 {} should be smaller than raw {}",
+            fips.len(),
+            raw.len()
         );
     }
 
@@ -720,17 +917,17 @@ mod tests {
             s2: vec![0i16; 512],
         };
 
-        let encoded = encode_signature_compressed(&sig, 512);
+        let encoded = encode_signature(&sig, 512);
         let (decoded, n) = decode_signature(&encoded).unwrap();
 
         assert_eq!(n, 512);
         assert_eq!(sig.s2, decoded.s2);
 
         // 512 coefficients * 1 bit each = 64 bytes for coeff data + header
-        let header = 4 + 2 + NONCE_SIZE; // 46
+        let header = 1 + NONCE_SIZE; // FIPS 206: 1 byte header + 40 byte nonce = 41
         assert!(
             encoded.len() <= header + 65, // 64 bytes of bits + 1 rounding
-            "All-zero compressed size {} should be near {} bytes",
+            "All-zero FIPS 206 size {} should be near {} bytes",
             encoded.len(),
             header + 64
         );
@@ -749,16 +946,16 @@ mod tests {
                 .collect(),
         };
 
-        let encoded = encode_signature_compressed(&sig, 512);
+        let encoded = encode_signature(&sig, 512);
         let (decoded, _) = decode_signature(&encoded).unwrap();
         assert_eq!(sig.s2, decoded.s2);
 
-        let uncompressed = encode_signature(&sig, 512);
+        let raw = encode_signature_raw(&sig, 512);
         assert!(
-            encoded.len() < uncompressed.len(),
-            "Small-value compressed {} < uncompressed {}",
+            encoded.len() < raw.len(),
+            "FIPS 206 {} < raw {}",
             encoded.len(),
-            uncompressed.len()
+            raw.len()
         );
     }
 

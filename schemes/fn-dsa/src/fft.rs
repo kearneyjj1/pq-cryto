@@ -39,11 +39,10 @@ compile_error!(
 
 /// Verifies that the floating-point environment uses IEEE 754 round-to-nearest-even,
 /// which is required for FALCON's FFT arithmetic to produce consistent results.
-/// Only asserts in debug builds; compiles to nothing in release.
 fn assert_fp_rounding_mode() {
     // In round-to-nearest-even, 1.0 + epsilon/2 rounds to 1.0 (ties go to even).
     // In round-up mode this would produce 1.0 + epsilon instead.
-    debug_assert_eq!(
+    assert_eq!(
         1.0f64 + f64::EPSILON / 2.0,
         1.0f64,
         "Floating-point rounding mode is not round-to-nearest-even. \
@@ -128,13 +127,20 @@ impl Complex {
         }
     }
 
-    /// Computes the multiplicative inverse 1/z.
+    /// Computes the multiplicative inverse 1/z using Smith's algorithm.
+    ///
+    /// Avoids computing `re^2 + im^2` which can overflow or underflow for
+    /// extreme magnitudes. Instead divides through by the larger component.
     #[inline]
     pub fn inverse(self) -> Self {
-        let norm_sq = self.norm_sq();
-        Complex {
-            re: self.re / norm_sq,
-            im: -self.im / norm_sq,
+        if self.re.abs() >= self.im.abs() {
+            let r = self.im / self.re;
+            let d = self.re + self.im * r;
+            Complex { re: 1.0 / d, im: -r / d }
+        } else {
+            let r = self.re / self.im;
+            let d = self.im + self.re * r;
+            Complex { re: r / d, im: -1.0 / d }
         }
     }
 
@@ -351,6 +357,10 @@ fn fft_recursive(coeffs: &[Complex], roots: &[Complex], n: usize) -> Vec<Complex
     let f0 = fft_recursive(&even, child_roots, hn);
     let f1 = fft_recursive(&odd, child_roots, hn);
 
+    // Zeroize secret-derived temporaries
+    even.zeroize();
+    odd.zeroize();
+
     // Merge: f_fft[2i] = f0[i] + w[2i]*f1[i], f_fft[2i+1] = f0[i] - w[2i]*f1[i]
     let mut result = vec![Complex::ZERO; n];
     for i in 0..hn {
@@ -402,6 +412,10 @@ fn ifft_recursive(fft_vals: &[Complex], roots: &[Complex], n: usize) -> Vec<Comp
 
     let even = ifft_recursive(&f0, child_roots, hn);
     let odd = ifft_recursive(&f1, child_roots, hn);
+
+    // Zeroize secret-derived temporaries
+    f0.zeroize();
+    f1.zeroize();
 
     // Merge coefficients: interleave even and odd
     let mut result = vec![Complex::ZERO; n];

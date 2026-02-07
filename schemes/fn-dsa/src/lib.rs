@@ -67,7 +67,7 @@ pub use packing::{
     encode_public_key, decode_public_key,
     encode_secret_key, decode_secret_key,
     encode_signature, decode_signature,
-    encode_signature_compressed,
+    encode_signature_raw, encode_signature_compressed,
     encode_keypair, decode_keypair,
     to_hex, from_hex,
 };

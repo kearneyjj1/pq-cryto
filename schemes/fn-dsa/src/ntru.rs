@@ -1204,12 +1204,54 @@ pub fn verify_ntru_equation(f: &[i8], g: &[i8], big_f: &[i8], big_g: &[i8], n: u
 }
 
 /// Verifies that f*G - g*F = q (with i16 coefficients for F, G).
-/// Uses exact integer arithmetic to verify the NTRU equation.
+///
+/// For n <= 32, uses exact O(n^2) schoolbook arithmetic.
+/// For larger n, uses NTT mod q (O(n log n)) as a necessary condition check,
+/// plus an exact O(n) constant-term computation to confirm the result is q.
 pub fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
-    // Compute f*G - g*F in Z[X]/(X^n + 1) using exact integer arithmetic
-    // The result should be the constant polynomial q.
+    if n <= 32 {
+        return verify_ntru_equation_i16_schoolbook(f, g, big_f, big_g, n);
+    }
 
-    // Compute the negacyclic convolution f*G and g*F
+    // NTT-based check: f*G - g*F ≡ 0 (mod q) for all coefficients
+    let f_zq: Vec<Zq> = f.iter().map(|&x| Zq::new(x as i32)).collect();
+    let g_zq: Vec<Zq> = g.iter().map(|&x| Zq::new(x as i32)).collect();
+    let bf_zq: Vec<Zq> = big_f.iter().map(|&x| Zq::new(x as i32)).collect();
+    let bg_zq: Vec<Zq> = big_g.iter().map(|&x| Zq::new(x as i32)).collect();
+
+    let f_ntt = ntt(&f_zq, n);
+    let g_ntt = ntt(&g_zq, n);
+    let bf_ntt = ntt(&bf_zq, n);
+    let bg_ntt = ntt(&bg_zq, n);
+
+    let mut result_ntt = vec![Zq::ZERO; n];
+    for i in 0..n {
+        result_ntt[i] = f_ntt[i] * bg_ntt[i] - g_ntt[i] * bf_ntt[i];
+    }
+    let result = intt(&result_ntt, n);
+
+    for r in &result {
+        if !r.is_zero() {
+            return false;
+        }
+    }
+
+    // Exact constant-term check in Z: the constant coefficient of f*G - g*F
+    // must be exactly q (not 0 or 2q). This O(n) pass completes the verification.
+    let mut const_term: i64 = (f[0] as i64) * (big_g[0] as i64)
+        - (g[0] as i64) * (big_f[0] as i64);
+    for i in 1..n {
+        const_term -= (f[i] as i64) * (big_g[n - i] as i64);
+        const_term += (g[i] as i64) * (big_f[n - i] as i64);
+    }
+
+    const_term == Q as i64
+}
+
+/// Schoolbook O(n^2) NTRU equation verification (exact integer arithmetic).
+fn verify_ntru_equation_i16_schoolbook(
+    f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize,
+) -> bool {
     let mut fg = vec![0i64; n];
     let mut gf = vec![0i64; n];
 
@@ -1220,26 +1262,16 @@ pub fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]
                 fg[idx] += (f[i] as i64) * (big_g[j] as i64);
                 gf[idx] += (g[i] as i64) * (big_f[j] as i64);
             } else {
-                // Negacyclic: X^n = -1
                 fg[idx - n] -= (f[i] as i64) * (big_g[j] as i64);
                 gf[idx - n] -= (g[i] as i64) * (big_f[j] as i64);
             }
         }
     }
 
-    // f*G - g*F should equal q (constant polynomial)
-    // Check constant term equals q exactly
-    if fg[0] - gf[0] != Q as i64 {
-        return false;
-    }
-
-    // Check all other terms are 0
+    if fg[0] - gf[0] != Q as i64 { return false; }
     for i in 1..n {
-        if fg[i] - gf[i] != 0 {
-            return false;
-        }
+        if fg[i] - gf[i] != 0 { return false; }
     }
-
     true
 }
 

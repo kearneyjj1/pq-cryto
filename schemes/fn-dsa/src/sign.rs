@@ -104,7 +104,7 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     let bound_sq = sk.params.sig_bound_sq;
 
     // Create the FFT sampler using the LDL* tree from the secret key
-    let ff_sampler = FfSampler::new(sk.gs.clone(), sigma, sigma_min);
+    let ff_sampler = FfSampler::new(&sk.gs, sigma, sigma_min);
 
     // Precompute NTT-ready Poly forms of the secret key polynomials
     let mut f_poly = Poly::from_i16(&sk.f.iter().map(|&x| x as i16).collect::<Vec<_>>());
@@ -404,7 +404,7 @@ mod tests {
         let sigma = sk.params.sigma;
         let sigma_min = sk.params.sigma_min;
 
-        let ff_sampler = FfSampler::new(sk.gs.clone(), sigma, sigma_min);
+        let ff_sampler = FfSampler::new(&sk.gs, sigma, sigma_min);
 
         let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
         let mut big_f_fft: Vec<Complex> = sk.big_f.iter().map(|&x| Complex::from_real(x as f64)).collect();
