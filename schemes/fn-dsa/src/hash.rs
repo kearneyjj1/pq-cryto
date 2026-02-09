@@ -11,6 +11,12 @@ use crate::params::{Params, Q, NONCE_SIZE};
 ///
 /// Uses SHAKE256 to generate a uniformly random polynomial c ∈ Z_q[X]/(X^n + 1).
 /// The output polynomial has coefficients in [0, q-1].
+///
+/// Matches the Falcon reference implementation (`hash_to_point_ct`):
+/// - Input: SHAKE256(nonce || message)
+/// - Reads 2 bytes big-endian as a 16-bit value w
+/// - Accepts if w < 5*q = 61445, rejects otherwise
+/// - Reduces w mod q to get the coefficient
 pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     let n = params.n;
     let mut result = vec![Zq::ZERO; n];
@@ -23,18 +29,20 @@ pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     let mut reader = hasher.finalize_xof();
 
     // Generate n coefficients using rejection sampling
+    // (matching Falcon reference: big-endian, accept < 5*q, reduce mod q)
     let mut buf = [0u8; 2];
     let mut i = 0;
 
     while i < n {
         reader.read(&mut buf);
 
-        // Interpret as little-endian 16-bit value and mask to 14 bits
-        let val = u16::from_le_bytes(buf) & 0x3FFF;
+        // Big-endian interpretation (matching Falcon reference implementation)
+        let w = ((buf[0] as u32) << 8) | (buf[1] as u32);
 
-        // Reject if >= q
-        if val < Q as u16 {
-            result[i] = Zq::from_i16_unchecked(val as i16);
+        // Accept if w < 5*q = 61445, reject otherwise
+        if w < 61445 {
+            let val = (w % (Q as u32)) as i16;
+            result[i] = Zq::from_i16_unchecked(val);
             i += 1;
         }
     }
@@ -86,10 +94,12 @@ pub fn hash_challenge(
 
     while i < n {
         reader.read(&mut buf);
-        let val = u16::from_le_bytes(buf) & 0x3FFF;
 
-        if val < Q as u16 {
-            result[i] = Zq::from_i16_unchecked(val as i16);
+        let w = ((buf[0] as u32) << 8) | (buf[1] as u32);
+
+        if w < 61445 {
+            let val = (w % (Q as u32)) as i16;
+            result[i] = Zq::from_i16_unchecked(val);
             i += 1;
         }
     }

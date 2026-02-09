@@ -845,6 +845,330 @@ pub fn decode_keypair(bytes: &[u8]) -> Result<KeyPair> {
 }
 
 // ============================================================================
+// NIST KAT Format Decoders
+// ============================================================================
+
+/// Decodes a public key from NIST API format (as used in KAT vectors).
+///
+/// Format:
+/// - 1 byte: header = 0x00 + log2(n) (0x09 for FALCON-512, 0x0A for FALCON-1024)
+/// - ceil(n * 14 / 8) bytes: h coefficients packed as 14-bit unsigned values (LSB-first)
+///
+/// Total: 897 bytes for FALCON-512, 1793 bytes for FALCON-1024.
+pub fn decode_nist_public_key(bytes: &[u8]) -> Result<PublicKey> {
+    if bytes.is_empty() {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_public_key",
+            reason: "empty input",
+        });
+    }
+
+    let header = bytes[0];
+    let log_n = (header & 0x0F) as usize;
+    let n = 1usize << log_n;
+
+    let params = match n {
+        512 => FALCON_512,
+        1024 => FALCON_1024,
+        _ => {
+            return Err(FnDsaError::InvalidInput {
+                field: "nist_public_key",
+                reason: "unsupported n value from header",
+            });
+        }
+    };
+
+    // Each coefficient is 14 bits; total bits = n * 14
+    let data_bytes = (n * 14 + 7) / 8;
+    let expected_len = 1 + data_bytes;
+    if bytes.len() < expected_len {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_public_key",
+            reason: "incomplete coefficient data",
+        });
+    }
+
+    // The Falcon reference implementation uses MSB-first (big-endian) bit packing:
+    // new bytes are shifted in from the left (acc = (acc << 8) | byte),
+    // and coefficients are extracted from the top (acc >> (acc_len - 14)).
+    let data = &bytes[1..];
+    let mut h = Vec::with_capacity(n);
+    let mut acc: u32 = 0;
+    let mut acc_len: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    for _ in 0..n {
+        // Refill accumulator from MSB side
+        while acc_len < 14 {
+            if byte_idx >= data.len() {
+                return Err(FnDsaError::InvalidInput {
+                    field: "nist_public_key",
+                    reason: "truncated coefficient data",
+                });
+            }
+            acc = (acc << 8) | (data[byte_idx] as u32);
+            acc_len += 8;
+            byte_idx += 1;
+        }
+
+        // Extract 14-bit coefficient from the top of the accumulator
+        acc_len -= 14;
+        let coeff = ((acc >> acc_len) & 0x3FFF) as i16;
+
+        if coeff as i32 >= crate::params::Q {
+            return Err(FnDsaError::InvalidInput {
+                field: "nist_public_key",
+                reason: "h coefficient >= q",
+            });
+        }
+
+        h.push(coeff);
+    }
+
+    Ok(PublicKey { h, params })
+}
+
+/// Parses a NIST API signed message (sm) into its components.
+///
+/// The NIST `crypto_sign` output format for Falcon is:
+/// - 2 bytes: sig_ct_len (big-endian u16) — length of compressed signature (header + s2)
+/// - 40 bytes: nonce
+/// - mlen bytes: original message
+/// - sig_ct_len bytes: header_byte (0x20 + logn) || Golomb-Rice compressed s2
+///
+/// Total: smlen = 2 + 40 + mlen + sig_ct_len
+///
+/// Returns (message, Signature) where Signature contains the nonce and decoded s2.
+pub fn parse_nist_signed_message(sm: &[u8], mlen: usize) -> Result<(Vec<u8>, Signature)> {
+    if sm.len() < 2 + NONCE_SIZE {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_sm",
+            reason: "too short for length prefix and nonce",
+        });
+    }
+
+    // Read sig_ct_len (big-endian u16) — length of compressed signature
+    let sig_ct_len = ((sm[0] as usize) << 8) | (sm[1] as usize);
+
+    let expected_len = 2 + NONCE_SIZE + mlen + sig_ct_len;
+    if sm.len() < expected_len {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_sm",
+            reason: "incomplete signed message data",
+        });
+    }
+
+    // Extract nonce (bytes 2..42)
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce.copy_from_slice(&sm[2..2 + NONCE_SIZE]);
+
+    // Extract message (bytes 42..42+mlen)
+    let msg_start = 2 + NONCE_SIZE;
+    let message = sm[msg_start..msg_start + mlen].to_vec();
+
+    // Extract compressed signature (bytes 42+mlen..42+mlen+sig_ct_len)
+    let sig_start = msg_start + mlen;
+    let sig_data = &sm[sig_start..sig_start + sig_ct_len];
+
+    if sig_data.is_empty() {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_sm",
+            reason: "empty signature data",
+        });
+    }
+
+    // Parse header byte: 0x20 + logn for non-padded, 0x30 + logn for padded
+    let header = sig_data[0];
+    let log_n = (header & 0x0F) as usize;
+    let n = 1usize << log_n;
+
+    if n != 512 && n != 1024 {
+        return Err(FnDsaError::InvalidInput {
+            field: "nist_sm",
+            reason: "unsupported n from signature header",
+        });
+    }
+
+    // Decode compressed s2 using the original Falcon compression format
+    // (NOT FIPS 206 Golomb-Rice — the original uses sign+7bit+unary, MSB-first)
+    let compressed = &sig_data[1..]; // skip header byte
+    let s2 = decode_falcon_comp(compressed, n)?;
+
+    Ok((message, Signature { nonce, s2 }))
+}
+
+/// Decodes Golomb-Rice compressed s2 coefficients from raw byte data.
+///
+/// This is the core decompression shared between FIPS 206 and original Falcon formats.
+/// The encoding is identical; only the header byte value differs.
+fn decode_golomb_rice_coefficients(data: &[u8], n: usize) -> Result<Vec<i16>> {
+    let k = rice_k_for_n(n);
+    let k_mask = (1u64 << k) - 1;
+
+    let mut s2 = Vec::with_capacity(n);
+    let mut bit_buffer: u64 = 0;
+    let mut bit_count: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
+        while *bc < need && *bi < data.len() {
+            *buf |= (data[*bi] as u64) << *bc;
+            *bc += 8;
+            *bi += 1;
+        }
+    };
+
+    let max_coeff = (crate::params::Q / 2) as i16;
+
+    for _ in 0..n {
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+        if bit_count < 1 {
+            return Err(FnDsaError::InvalidInput {
+                field: "compressed_s2",
+                reason: "truncated coefficient data",
+            });
+        }
+        let nonzero = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        if nonzero == 0 {
+            s2.push(0i16);
+            continue;
+        }
+
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
+        if bit_count < 1 + k {
+            return Err(FnDsaError::InvalidInput {
+                field: "compressed_s2",
+                reason: "truncated coefficient data",
+            });
+        }
+        let sign = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        let low = bit_buffer & k_mask;
+        bit_buffer >>= k;
+        bit_count -= k;
+
+        let mut high: u64 = 0;
+        loop {
+            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+            if bit_count < 1 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "compressed_s2",
+                    reason: "truncated unary in coefficient data",
+                });
+            }
+            let bit = bit_buffer & 1;
+            bit_buffer >>= 1;
+            bit_count -= 1;
+            if bit == 1 {
+                break;
+            }
+            high += 1;
+            if high > 64 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "compressed_s2",
+                    reason: "unary overflow in coefficient data",
+                });
+            }
+        }
+
+        let combined = (high << k) | low;
+        if combined >= i16::MAX as u64 {
+            return Err(FnDsaError::InvalidInput {
+                field: "compressed_s2",
+                reason: "s2 coefficient exceeds i16 range",
+            });
+        }
+        let abs_val = (combined as i16) + 1;
+        if abs_val > max_coeff {
+            return Err(FnDsaError::InvalidInput {
+                field: "compressed_s2",
+                reason: "s2 coefficient out of range",
+            });
+        }
+        let coeff = if sign == 1 { -abs_val } else { abs_val };
+        s2.push(coeff);
+    }
+
+    Ok(s2)
+}
+
+/// Decodes signature coefficients using the original Falcon compression format.
+///
+/// This matches the C reference implementation's `comp_decode` function.
+/// The encoding per coefficient is:
+/// - 8 bits: sign (bit 7) + low 7 magnitude bits (bits 6-0)
+/// - Unary: count zero bits (MSB-first) until a 1-bit, magnitude += count * 128
+///
+/// The bit stream is read MSB-first (big-endian bit ordering), unlike the FIPS 206
+/// Golomb-Rice format which uses LSB-first.
+fn decode_falcon_comp(data: &[u8], n: usize) -> Result<Vec<i16>> {
+    let mut s2 = Vec::with_capacity(n);
+    let mut acc: u32 = 0;
+    let mut acc_len: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    for _ in 0..n {
+        // Read one byte for sign + low 7 bits of magnitude
+        if byte_idx >= data.len() {
+            return Err(FnDsaError::InvalidInput {
+                field: "falcon_comp",
+                reason: "truncated coefficient data",
+            });
+        }
+        acc = (acc << 8) | (data[byte_idx] as u32);
+        byte_idx += 1;
+
+        let b = (acc >> acc_len) & 0xFF;
+        let sign = (b >> 7) & 1;
+        let mut m = (b & 127) as u32;
+
+        // Read unary: count zeros until a 1 (MSB-first from accumulator)
+        loop {
+            if acc_len == 0 {
+                if byte_idx >= data.len() {
+                    return Err(FnDsaError::InvalidInput {
+                        field: "falcon_comp",
+                        reason: "truncated unary data",
+                    });
+                }
+                acc = (acc << 8) | (data[byte_idx] as u32);
+                byte_idx += 1;
+                acc_len = 8;
+            }
+            acc_len -= 1;
+            if ((acc >> acc_len) & 1) != 0 {
+                break;
+            }
+            m += 128;
+            if m > 2047 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "falcon_comp",
+                    reason: "magnitude overflow",
+                });
+            }
+        }
+
+        // "-0" is forbidden
+        if sign != 0 && m == 0 {
+            return Err(FnDsaError::InvalidInput {
+                field: "falcon_comp",
+                reason: "invalid -0 encoding",
+            });
+        }
+
+        let coeff = if sign != 0 { -(m as i16) } else { m as i16 };
+        s2.push(coeff);
+    }
+
+    Ok(s2)
+}
+
+// ============================================================================
 // Hex encoding utilities
 // ============================================================================
 
