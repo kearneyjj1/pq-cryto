@@ -2,21 +2,12 @@
 //!
 //! This tests the complete FALCON-512 implementation:
 //! - Key generation with NTRU equation solving
-//! - Signing with FFT lattice sampling
-//! - Verification
+//! - Signing with FFT lattice sampling (ffSampling with LDL* tree)
+//! - Verification with NTT-based modular arithmetic
 //! - Serialization
-//!
-//! NOTE: This educational implementation uses a very relaxed signature bound
-//! (10 billion vs ~34 million in real FALCON). This is because implementing
-//! the full ffSampling algorithm is complex. The relaxed bound means:
-//! 1. Signatures verify correctly
-//! 2. Wrong messages may sometimes pass verification (false positives)
-//! 3. The implementation is NOT cryptographically secure
-//!
-//! For production use, a complete ffSampling implementation is required.
 
 use pqsigs_fn_dsa::{
-    keygen_512, sign, verify, sign_simple,
+    keygen_512, sign, verify,
     encode_public_key, decode_public_key,
     encode_secret_key, decode_secret_key,
 };
@@ -51,35 +42,21 @@ fn main() {
         }
         Err(e) => {
             println!("   FFT signing failed: {}", e);
-
-            // Try simplified sampler
-            println!("\n3. Trying simplified sampler...");
-            match sign_simple(&mut rng, &keypair.sk, message) {
-                Ok(s) => {
-                    println!("   Signature s2 norm^2: {}", s.norm_sq());
-                    println!("   Simple Signing: SUCCESS\n");
-                    Some(s)
-                }
-                Err(e2) => {
-                    println!("   Simple signing also failed: {}", e2);
-                    None
-                }
-            }
+            None
         }
     };
 
     // Verify if we got a signature
     if let Some(sig) = sig {
-        println!("4. Verification...");
+        println!("3. Verification...");
         match verify(&keypair.pk, message, &sig) {
             Ok(()) => {
                 println!("   Verification: SUCCESS\n");
 
-                // Test with wrong message
-                // NOTE: With relaxed bounds, wrong messages may pass!
-                println!("5. Wrong message test...");
+                // Test with wrong message — must fail for FALCON-512
+                println!("4. Wrong message test...");
                 match verify(&keypair.pk, b"Wrong message", &sig) {
-                    Ok(()) => println!("   NOTE: Wrong message accepted (expected with relaxed bound)"),
+                    Ok(()) => println!("   WARNING: Wrong message accepted (unexpected)"),
                     Err(_) => println!("   Wrong message rejected: SUCCESS\n"),
                 }
             }
@@ -93,7 +70,7 @@ fn main() {
     }
 
     // Serialization
-    println!("6. Serialization...");
+    println!("5. Serialization...");
     let pk_bytes = encode_public_key(&keypair.pk);
     let sk_bytes = encode_secret_key(&keypair.sk);
     println!("   Public key: {} bytes", pk_bytes.len());

@@ -6,12 +6,13 @@ Rust implementations of post-quantum digital signature schemes. Built for learni
 
 ## Security Status
 
-This codebase has undergone security review with the following measures implemented:
+This codebase has undergone multiple rounds of security review with the following measures implemented:
 
 - **Secure Memory Handling**: Secret keys implement `Drop` with zeroization via the `zeroize` crate
-- **Constant-Time Operations**: GF(2^8) multiplication and matrix operations use constant-time techniques
+- **Constant-Time Operations**: BerExp, RCDT sampling, field arithmetic, and GF(2^8) operations use constant-time techniques
 - **Input Validation**: All deserialization functions validate coefficient ranges and structural integrity
 - **Error Handling**: Proper `Result` types instead of panics for invalid parameters
+- **KAT Validation**: FN-DSA (FALCON-512) passes all 100 NIST PQC Known Answer Test vectors
 - **Documentation**: Comprehensive security limitations documented in [SECURITY.md](SECURITY.md)
 
 ## Implemented Schemes
@@ -19,6 +20,8 @@ This codebase has undergone security review with the following measures implemen
 ### ML-DSA (FIPS 204)
 
 Module-Lattice Digital Signature Algorithm, the NIST post-quantum signature standard (formerly CRYSTALS-Dilithium).
+
+**Status**: FIPS 204 finalized (August 2024).
 
 **Security basis**: Module Learning With Errors (M-LWE) and Module Short Integer Solution (M-SIS) problems.
 
@@ -41,6 +44,8 @@ assert!(verify(&pk, b"message", &sig).is_ok());
 
 Fast Fourier Lattice-based Compact Signatures over NTRU, a NIST post-quantum signature standard.
 
+**Status**: FIPS 206 draft submitted to NIST for approval (August 2025). Initial Public Draft expected; final standard anticipated late 2026 / early 2027. Our implementation passes all 100 Falcon-512 KAT vectors from the NIST PQC reference implementation, validating correctness of the verification path (public key decoding, signature decompression, hash-to-point, NTT multiplication, and norm bound checking).
+
 **Security basis**: Hardness of the Short Integer Solution (SIS) problem over NTRU lattices.
 
 | Parameter Set | Security Level | Public Key | Secret Key | Signature |
@@ -56,8 +61,6 @@ let keypair = keygen_512(&mut OsRng).unwrap();
 let sig = sign(&mut OsRng, &keypair.sk, b"message").unwrap();
 assert!(verify(&keypair.pk, b"message", &sig).is_ok());
 ```
-
-**Note**: This is an educational implementation with relaxed signature bounds. Production FALCON requires the full `ffSampling` algorithm for cryptographic security.
 
 ### UOV (Unbalanced Oil and Vinegar)
 
@@ -96,15 +99,20 @@ pq-crypto/
 │   │       └── verify.rs    # Verification
 │   │
 │   ├── fn-dsa/          # FN-DSA (FALCON) implementation
-│   │   └── src/
-│   │       ├── fft.rs       # FFT for polynomial ring arithmetic
-│   │       ├── ntru.rs      # NTRUSolve algorithm
-│   │       ├── poly.rs      # Polynomial operations with NTT
-│   │       ├── gaussian.rs  # Discrete Gaussian sampling
-│   │       ├── sampler.rs   # FFT sampler for signing
-│   │       ├── keygen.rs    # Key generation with NTRU equation
-│   │       ├── sign.rs      # Signature generation
-│   │       └── verify.rs    # Verification
+│   │   ├── src/
+│   │   │   ├── fft.rs       # FFT for polynomial ring arithmetic
+│   │   │   ├── ntru.rs      # NTRUSolve algorithm
+│   │   │   ├── poly.rs      # Polynomial operations with NTT
+│   │   │   ├── hash.rs      # SHAKE256 hash-to-point (matches Falcon reference)
+│   │   │   ├── gaussian.rs  # Discrete Gaussian sampling
+│   │   │   ├── sampler.rs   # FFT sampler for signing
+│   │   │   ├── packing.rs   # Key/signature serialization (FIPS 206 + NIST KAT formats)
+│   │   │   ├── keygen.rs    # Key generation with NTRU equation
+│   │   │   ├── sign.rs      # Signature generation
+│   │   │   └── verify.rs    # Verification
+│   │   └── tests/
+│   │       ├── kat_falcon512.rs      # NIST KAT verification tests (100 vectors)
+│   │       └── falcon512-KAT.rsp    # Official Falcon-512 KAT vectors
 │   │
 │   └── uov/             # UOV implementation
 │       └── src/
@@ -131,21 +139,21 @@ cd schemes/ml-dsa && cargo test
 cd schemes/fn-dsa && cargo test
 cd schemes/uov && cargo test
 
-# Run FALCON-512 integration test
-cd schemes/fn-dsa && cargo run --bin falcon512_test
+# Run FALCON-512 KAT verification (100 vectors)
+cd schemes/fn-dsa && cargo test --release --test kat_falcon512
 
-# Run with optimizations (recommended for benchmarking)
+# Run with optimizations (recommended)
 cargo test --release
 ```
 
 ## Test Coverage
 
-**Total: 307 tests passing**
+**Total: 333 tests passing**
 
 | Scheme | Tests | Coverage |
 |--------|-------|----------|
 | ML-DSA | 130 | All parameter sets (44/65/87), NTT operations, polynomial arithmetic, roundtrip verification, tampering detection, packing/unpacking, edge cases |
-| FN-DSA | 100 | FFT operations, NTRUSolve (n=2 to 512), Gaussian sampling, polynomial arithmetic, sign/verify integration |
+| FN-DSA | 126 | 121 unit tests + 5 KAT integration tests. FFT operations, NTRUSolve (n=2 to 512), Gaussian sampling, NTT polynomial arithmetic, sign/verify roundtrip (n=16, 512), NIST Falcon-512 KAT verification (100/100 vectors passing) |
 | UOV | 77 | 27 unit + 46 integration + 4 doc tests covering all parameter sets, GF(2^8) field arithmetic, matrix operations, tampering detection, cross-key rejection, stress tests |
 
 ## Implementation Notes
@@ -159,9 +167,14 @@ cargo test --release
 ### FN-DSA (FALCON)
 - Implements recursive NTRUSolve algorithm for finding F, G such that fG - gF = q
 - Uses FFT/iFFT for fast polynomial arithmetic in the negacyclic ring Z[X]/(X^n + 1)
+- Exact modular arithmetic via Number Theoretic Transform (NTT) for verification
 - Modular arithmetic over Z_q with q = 12289 (NTT-friendly prime)
-- Discrete Gaussian sampling using the ziggurat method
-- **Educational note**: Uses relaxed signature bounds; production use requires full `ffSampling`
+- Discrete Gaussian sampling with constant-time BerExp and RCDT
+- SHAKE256 hash-to-point matching the Falcon reference implementation
+- Supports both FIPS 206 wire format and original Falcon NIST API format
+- Verified against all 100 official Falcon-512 NIST PQC KAT vectors
+- **Note**: Keygen and signing use our own randomness (not the NIST AES-CTR-DRBG), so byte-for-byte reproducibility of reference keygen/signatures is not possible. KAT testing is verification-only.
+- **Note**: FIPS 206 is not yet finalized. Once official FIPS 206 KAT vectors are published, they will be integrated separately. The current KAT vectors are from the original Falcon NIST PQC submission, which uses a slightly different wire format (header bytes, compression scheme).
 
 ### UOV
 - Implements GF(2^8) field arithmetic with irreducible polynomial x^8 + x^4 + x^3 + x + 1
@@ -171,7 +184,8 @@ cargo test --release
 ## References
 
 - [FIPS 204: ML-DSA Standard](https://csrc.nist.gov/pubs/fips/204/final)
-- [FIPS 206: FN-DSA (FALCON) Standard](https://csrc.nist.gov/pubs/fips/206/final)
+- [FIPS 205: SLH-DSA Standard](https://csrc.nist.gov/pubs/fips/205/final)
+- [FIPS 206: FN-DSA (FALCON)](https://csrc.nist.gov/presentations/2025/fips-206-fn-dsa-falcon) (draft, not yet finalized)
 - [NIST Post-Quantum Cryptography](https://csrc.nist.gov/projects/post-quantum-cryptography)
 - [NIST Additional Digital Signatures](https://csrc.nist.gov/projects/pqc-dig-sig)
 - [FALCON Specification](https://falcon-sign.info/)

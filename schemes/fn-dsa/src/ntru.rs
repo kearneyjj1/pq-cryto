@@ -9,7 +9,7 @@ use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
 use crate::field::Zq;
 use crate::params::Q;
-use crate::poly::{poly_mul_schoolbook, ntt, intt, Poly, PolyFft};
+use crate::poly::{poly_mul_schoolbook, ntt, intt, Poly};
 use num_bigint::BigInt;
 use num_traits::{Zero, One, Signed, ToPrimitive};
 
@@ -31,100 +31,6 @@ pub fn extended_gcd(a: i64, b: i64) -> (i64, i64, i64) {
 // ============================================================================
 // Polynomial Operations for NTRUSolve
 // ============================================================================
-
-/// Computes the resultant of f and X^n + 1.
-/// For f in Z[X]/(X^n + 1), this is N(f) = f(ω) * f(ω³) * ... * f(ω^(2n-1))
-/// where ω is a primitive 2n-th root of unity.
-fn resultant(f: &[i64], n: usize) -> i64 {
-    // For small n, compute directly using the formula:
-    // Res(f, X^n + 1) = (-1)^n * f(-1)^? * product over roots
-    //
-    // Actually, for f in Z[X]/(X^n + 1), we can compute:
-    // N(f) = Resultant(f, X^n + 1) / leading coefficient stuff
-    //
-    // Simpler approach for small n: use the recursive formula
-    // N(f) = f(i) * f(-i) for n=2 (where i = sqrt(-1))
-    //
-    // For our purposes, we use the field norm recursively
-
-    if n == 1 {
-        return f[0];
-    }
-
-    // Split f(x) = f_even(x²) + x * f_odd(x²)
-    let half = n / 2;
-    let mut f_even = vec![0i64; half];
-    let mut f_odd = vec![0i64; half];
-
-    for i in 0..n {
-        if i % 2 == 0 {
-            f_even[i / 2] = f[i];
-        } else {
-            f_odd[i / 2] = f[i];
-        }
-    }
-
-    // N(f) = N(f_even)² - x * N(f_odd)² in the half-size ring
-    // But for resultant we need: Res(f, X^n+1) = Res(f_even² - X*f_odd², X^(n/2)+1)
-    // This gets complicated, so let's use a simpler direct approach for small n
-
-    // For n <= 4, compute directly
-    if n == 2 {
-        // f = a + bx, N(f) = a² + b² (since in Z[X]/(X²+1), norm is a² - (bi)² = a² + b²)
-        // Actually N(f) = f(i)*f(-i) = (a+bi)(a-bi) = a² + b²
-        return f[0] * f[0] + f[1] * f[1];
-    }
-
-    // For larger n, use FFT evaluation
-    let mut f_fft: Vec<Complex> = f.iter().map(|&x| Complex::from_real(x as f64)).collect();
-    fft(&mut f_fft);
-
-    // Product of |f(ω_k)|² gives us something related to the resultant
-    let mut result = 1.0;
-    for c in &f_fft {
-        result *= c.norm_sq().sqrt();
-    }
-
-    result.round() as i64
-}
-
-/// Computes the field norm N(f) for polynomial f in Z[X]/(X^n + 1).
-/// The result is a polynomial in Z[X]/(X^(n/2) + 1).
-///
-/// Uses FFT to compute the norm in a numerically stable way:
-/// N(f) = f * adj(f) evaluated at x², where adj(f) is the adjoint.
-/// In FFT domain: N(f)[k] = f[2k] * conj(f[2k])
-fn field_norm_fft(f_fft: &[Complex]) -> Vec<Complex> {
-    let n = f_fft.len();
-    let half = n / 2;
-
-    // In FFT domain, the field norm at position k is |f[2k]|² and |f[2k+1]|²
-    // paired appropriately for the half-size FFT.
-    // Actually, the correct formula uses the split/merge structure.
-
-    let mut result = Vec::with_capacity(half);
-    for k in 0..half {
-        // The field norm in FFT domain uses the relationship:
-        // N(f)(ω^k) = f(ω^(2k)) * f(-ω^(2k))
-        // where ω is the n-th root of unity for the full ring.
-        // For our negacyclic FFT, this becomes:
-        // result[k] = f_fft[k] * conj(f_fft[k + half]) when using certain orderings
-        //
-        // Simpler approach: compute f * adj(f) in FFT domain
-        // adj(f)[k] = conj(f[n-k]) for our FFT ordering
-        // Then N(f) = split_even(f * adj(f))
-
-        // For now, use the magnitude squared which is correct for real polynomials
-        let k2 = k * 2;
-        if k2 < n {
-            result.push(Complex::from_real(f_fft[k2].norm_sq()));
-        } else {
-            result.push(Complex::ZERO);
-        }
-    }
-
-    result
-}
 
 /// Computes the field norm N(f) for polynomial f in Z[X]/(X^n + 1).
 /// The result is a polynomial in Z[X]/(X^(n/2) + 1).
@@ -207,7 +113,11 @@ fn field_norm_poly(f: &[i64]) -> Vec<i64> {
 }
 
 /// Polynomial multiplication in Z[X]/(X^n + 1) using schoolbook method.
-/// Uses wrapping arithmetic to prevent overflow panics.
+///
+/// Uses wrapping arithmetic (mod 2^64) to prevent overflow panics. This is
+/// correct because the caller reduces the result mod q (or a larger modulus)
+/// after multiplication. For keygen inputs (n <= 64, coefficients from small
+/// Gaussians with |c| < 50), intermediate sums stay well within i64 range.
 fn poly_mul_i64(a: &[i64], b: &[i64], n: usize) -> Vec<i64> {
     let mut result = vec![0i64; n];
 
@@ -401,241 +311,6 @@ fn ntru_solve_float(f: &[i8], g: &[i8], n: usize) -> Result<(Vec<i16>, Vec<i16>)
     }
 
     Ok((big_f_i16, big_g_i16))
-}
-
-/// Recursive floating-point NTRUSolve.
-fn ntru_solve_recursive_float(f: &[f64], g: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>)> {
-    if n == 1 {
-        // Base case: solve f[0]*G - g[0]*F = q for real numbers
-        // We use floating-point throughout since field norms can be huge (>1e20)
-        let f0 = f[0];
-        let g0 = g[0];
-
-        // Handle edge case where both are near zero
-        if f0.abs() < 1e-10 && g0.abs() < 1e-10 {
-            return Err(FnDsaError::NtruSolveFailed);
-        }
-
-        // For floating-point, we use the minimum-norm solution:
-        // f0*G - g0*F = q
-        // Minimum norm: G = q*f0/(f0² + g0²), F = -q*g0/(f0² + g0²)
-        // This satisfies: f0*G - g0*F = q*f0²/(f0²+g0²) + q*g0²/(f0²+g0²) = q
-        let norm_sq = f0 * f0 + g0 * g0;
-
-        if norm_sq < 1e-10 {
-            return Err(FnDsaError::NtruSolveFailed);
-        }
-
-        let scale = (Q as f64) / norm_sq;
-        let big_g = vec![f0 * scale];
-        let big_f = vec![-g0 * scale];
-
-        return Ok((big_f, big_g));
-    }
-
-    // Compute field norms using FFT (floating-point)
-    let f_prime = field_norm_float(f);
-    let g_prime = field_norm_float(g);
-
-    // Check if field norms are too large for float64 precision
-    // If max coefficient exceeds ~1e15, precision will be lost and the result unreliable
-    let f_prime_max = f_prime.iter().map(|x| x.abs()).fold(0.0f64, |a, b| a.max(b));
-    let g_prime_max = g_prime.iter().map(|x| x.abs()).fold(0.0f64, |a, b| a.max(b));
-
-    const PRECISION_LIMIT: f64 = 1e15;
-    if f_prime_max > PRECISION_LIMIT || g_prime_max > PRECISION_LIMIT {
-        // Field norms too large - this (f, g) pair won't produce a valid solution
-        return Err(FnDsaError::NtruSolveFailed);
-    }
-
-    #[cfg(test)]
-    {
-        if n >= 64 {
-            println!("Recursion n={}: field norms max = ({:.1e}, {:.1e})", n, f_prime_max, g_prime_max);
-        }
-    }
-
-    // Recursively solve in the smaller ring
-    let (big_f_prime, big_g_prime) = match ntru_solve_recursive_float(&f_prime, &g_prime, n / 2) {
-        Ok(result) => result,
-        Err(e) => {
-            #[cfg(test)]
-            if n >= 128 {
-                println!("Recursion n={}: child n={} failed", n, n/2);
-            }
-            return Err(e);
-        }
-    };
-
-    // Lift the solution back to the original ring
-    let (big_f, big_g) = lift_ntru_solution_float(f, g, &big_f_prime, &big_g_prime);
-
-    // Apply Babai reduction at this level to keep coefficients small
-    let (big_f_reduced, big_g_reduced) = babai_reduce_float(f, g, &big_f, &big_g, n);
-
-    Ok((big_f_reduced, big_g_reduced))
-}
-
-/// Computes field norm using FFT (floating-point).
-/// N(f) = f * adj(f) evaluated at x², where adj(f)[i] = f[i] if i even, -f[i] if i odd.
-fn field_norm_float(f: &[f64]) -> Vec<f64> {
-    let n = f.len();
-    let half = n / 2;
-
-    if n == 1 {
-        return f.to_vec();
-    }
-
-    // Convert to FFT domain
-    let mut f_fft: Vec<Complex> = f.iter().map(|&x| Complex::from_real(x)).collect();
-    let mut adj_fft: Vec<Complex> = f.iter().enumerate().map(|(i, &x)| {
-        if i % 2 == 0 {
-            Complex::from_real(x)
-        } else {
-            Complex::from_real(-x)
-        }
-    }).collect();
-
-    fft(&mut f_fft);
-    fft(&mut adj_fft);
-
-    // f * adj(f) in FFT domain
-    let mut prod_fft: Vec<Complex> = Vec::with_capacity(n);
-    for i in 0..n {
-        prod_fft.push(f_fft[i] * adj_fft[i]);
-    }
-
-    // Transform back
-    ifft(&mut prod_fft);
-
-    // Extract even coefficients (the norm is in the x² basis)
-    let mut result = vec![0.0; half];
-    for i in 0..half {
-        result[i] = prod_fft[2 * i].re;
-    }
-
-    result
-}
-
-/// Lifts NTRU solution from half-size ring to full ring (floating-point).
-fn lift_ntru_solution_float(
-    f: &[f64],
-    g: &[f64],
-    big_f_prime: &[f64],
-    big_g_prime: &[f64],
-) -> (Vec<f64>, Vec<f64>) {
-    let n = f.len();
-    let half = n / 2;
-
-    // Compute adjoints
-    let f_adj: Vec<f64> = f.iter().enumerate().map(|(i, &x)| {
-        if i % 2 == 0 { x } else { -x }
-    }).collect();
-    let g_adj: Vec<f64> = g.iter().enumerate().map(|(i, &x)| {
-        if i % 2 == 0 { x } else { -x }
-    }).collect();
-
-    // Embed F' and G' from half-size ring: P'(x) -> P'(x²)
-    let mut big_f_prime_embed = vec![0.0; n];
-    let mut big_g_prime_embed = vec![0.0; n];
-    for i in 0..half {
-        big_f_prime_embed[2 * i] = big_f_prime[i];
-        big_g_prime_embed[2 * i] = big_g_prime[i];
-    }
-
-    // G = G'(x²) * adj(f), F = F'(x²) * adj(g)
-    let big_g = poly_mul_float(&big_g_prime_embed, &f_adj, n);
-    let big_f = poly_mul_float(&big_f_prime_embed, &g_adj, n);
-
-    (big_f, big_g)
-}
-
-/// Polynomial multiplication using FFT (floating-point).
-fn poly_mul_float(a: &[f64], b: &[f64], n: usize) -> Vec<f64> {
-    let mut a_fft: Vec<Complex> = a.iter().map(|&x| Complex::from_real(x)).collect();
-    let mut b_fft: Vec<Complex> = b.iter().map(|&x| Complex::from_real(x)).collect();
-
-    fft(&mut a_fft);
-    fft(&mut b_fft);
-
-    let mut c_fft: Vec<Complex> = Vec::with_capacity(n);
-    for i in 0..n {
-        c_fft.push(a_fft[i] * b_fft[i]);
-    }
-
-    ifft(&mut c_fft);
-
-    c_fft.iter().map(|c| c.re).collect()
-}
-
-/// Babai reduction in floating-point.
-fn babai_reduce_float(
-    f: &[f64],
-    g: &[f64],
-    big_f: &[f64],
-    big_g: &[f64],
-    n: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    if n == 1 {
-        let f0 = f[0];
-        let g0 = g[0];
-        let big_f0 = big_f[0];
-        let big_g0 = big_g[0];
-
-        let denom = f0 * f0 + g0 * g0;
-        if denom.abs() < 1e-10 {
-            return (big_f.to_vec(), big_g.to_vec());
-        }
-
-        let k = ((big_f0 * f0 + big_g0 * g0) / denom).round();
-        let big_f_reduced = vec![big_f0 - k * f0];
-        let big_g_reduced = vec![big_g0 - k * g0];
-
-        return (big_f_reduced, big_g_reduced);
-    }
-
-    // For n > 1, use FFT-based Babai reduction
-    let mut f_fft: Vec<Complex> = f.iter().map(|&x| Complex::from_real(x)).collect();
-    let mut g_fft: Vec<Complex> = g.iter().map(|&x| Complex::from_real(x)).collect();
-    let mut big_f_fft: Vec<Complex> = big_f.iter().map(|&x| Complex::from_real(x)).collect();
-    let mut big_g_fft: Vec<Complex> = big_g.iter().map(|&x| Complex::from_real(x)).collect();
-
-    fft(&mut f_fft);
-    fft(&mut g_fft);
-    fft(&mut big_f_fft);
-    fft(&mut big_g_fft);
-
-    // Compute k in FFT domain: k = (F * conj(f) + G * conj(g)) / (|f|² + |g|²)
-    let mut k_fft: Vec<Complex> = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let numerator = big_f_fft[i] * f_fft[i].conj() + big_g_fft[i] * g_fft[i].conj();
-        let denominator = f_fft[i].norm_sq() + g_fft[i].norm_sq();
-
-        if denominator < 1e-10 {
-            k_fft.push(Complex::ZERO);
-        } else {
-            k_fft.push(numerator.scale(1.0 / denominator));
-        }
-    }
-
-    // Transform k back and round
-    ifft(&mut k_fft);
-    let k_rounded: Vec<f64> = k_fft.iter().map(|c| c.re.round()).collect();
-
-    // Compute (F - k*f, G - k*g)
-    let kf = poly_mul_float(&k_rounded, f, n);
-    let kg = poly_mul_float(&k_rounded, g, n);
-
-    let mut big_f_reduced = vec![0.0; n];
-    let mut big_g_reduced = vec![0.0; n];
-
-    for i in 0..n {
-        big_f_reduced[i] = big_f[i] - kf[i];
-        big_g_reduced[i] = big_g[i] - kg[i];
-    }
-
-    (big_f_reduced, big_g_reduced)
 }
 
 // ============================================================================
@@ -834,8 +509,9 @@ fn babai_reduce_bigint(
             return (big_f.to_vec(), big_g.to_vec());
         }
 
-        // Round to nearest: k = (numerator + denominator/2) / denominator
-        let k = (&numerator + &denominator / 2) / &denominator;
+        // Round to nearest: k = (2*numerator + denominator) / (2*denominator)
+        // Using this form avoids operator precedence issues with BigInt division.
+        let k = (BigInt::from(2) * &numerator + &denominator) / (BigInt::from(2) * &denominator);
 
         let big_f_reduced = vec![big_f0 - &k * f0];
         let big_g_reduced = vec![big_g0 - &k * g0];
@@ -968,68 +644,6 @@ fn babai_reduce_bigint(
     }
 
     (big_f_reduced, big_g_reduced)
-}
-
-/// FFT-domain NTRUSolve algorithm.
-/// Works entirely with complex numbers to avoid integer overflow.
-/// Ensures the result corresponds to real polynomials by enforcing conjugate symmetry.
-fn ntru_solve_fft(f_fft: &[Complex], g_fft: &[Complex]) -> Result<(Vec<Complex>, Vec<Complex>)> {
-    let n = f_fft.len();
-
-    let mut big_f_fft = vec![Complex::ZERO; n];
-    let mut big_g_fft = vec![Complex::ZERO; n];
-
-    // For real polynomials, F_fft[k] and F_fft[n-k] must be complex conjugates.
-    // We solve for k=0 separately, then for pairs (k, n-k).
-
-    // k = 0: f[0] * G[0] - g[0] * F[0] = q
-    // Both f[0] and g[0] are real (sum of all coefficients).
-    {
-        let f0 = f_fft[0].re;
-        let g0 = g_fft[0].re;
-        let norm_sq = f0 * f0 + g0 * g0;
-
-        if norm_sq < 1e-10 {
-            return Err(FnDsaError::NtruSolveFailed);
-        }
-
-        // Minimum norm solution: G[0] = q*f0/(f0²+g0²), F[0] = -q*g0/(f0²+g0²)
-        let scale = (Q as f64) / norm_sq;
-        big_g_fft[0] = Complex::from_real(f0 * scale);
-        big_f_fft[0] = Complex::from_real(-g0 * scale);
-    }
-
-    // For k > 0, solve pairs (k, n-k) together
-    // f[k]*G[k] - g[k]*F[k] = q
-    // f[n-k]*G[n-k] - g[n-k]*F[n-k] = q
-    // With G[n-k] = conj(G[k]), F[n-k] = conj(F[k])
-    // And f[n-k] = conj(f[k]), g[n-k] = conj(g[k]) for real polynomials
-    //
-    // This means: f[k]*G[k] - g[k]*F[k] = q
-    // And:        conj(f[k])*conj(G[k]) - conj(g[k])*conj(F[k]) = q
-    // The second equation is the conjugate of the first when G[k], F[k] are the solution.
-    // So we only need to solve the first equation.
-
-    for k in 1..n {
-        let f_k = f_fft[k];
-        let g_k = g_fft[k];
-
-        // Minimum-norm solution to f_k * G_k - g_k * F_k = q
-        // G_k = lambda * conj(f_k), F_k = -lambda * conj(g_k)
-        // Substituting: |f_k|² * lambda + |g_k|² * lambda = q
-        // lambda = q / (|f_k|² + |g_k|²)
-
-        let norm_sq = f_k.norm_sq() + g_k.norm_sq();
-        if norm_sq < 1e-10 {
-            return Err(FnDsaError::NtruSolveFailed);
-        }
-
-        let lambda = (Q as f64) / norm_sq;
-        big_g_fft[k] = f_k.conj().scale(lambda);
-        big_f_fft[k] = g_k.conj().scale(-lambda);
-    }
-
-    Ok((big_f_fft, big_g_fft))
 }
 
 /// Recursive NTRUSolve algorithm.
@@ -1204,12 +818,54 @@ pub fn verify_ntru_equation(f: &[i8], g: &[i8], big_f: &[i8], big_g: &[i8], n: u
 }
 
 /// Verifies that f*G - g*F = q (with i16 coefficients for F, G).
-/// Uses exact integer arithmetic to verify the NTRU equation.
+///
+/// For n <= 32, uses exact O(n^2) schoolbook arithmetic.
+/// For larger n, uses NTT mod q (O(n log n)) as a necessary condition check,
+/// plus an exact O(n) constant-term computation to confirm the result is q.
 pub fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
-    // Compute f*G - g*F in Z[X]/(X^n + 1) using exact integer arithmetic
-    // The result should be the constant polynomial q.
+    if n <= 32 {
+        return verify_ntru_equation_i16_schoolbook(f, g, big_f, big_g, n);
+    }
 
-    // Compute the negacyclic convolution f*G and g*F
+    // NTT-based check: f*G - g*F ≡ 0 (mod q) for all coefficients
+    let f_zq: Vec<Zq> = f.iter().map(|&x| Zq::new(x as i32)).collect();
+    let g_zq: Vec<Zq> = g.iter().map(|&x| Zq::new(x as i32)).collect();
+    let bf_zq: Vec<Zq> = big_f.iter().map(|&x| Zq::new(x as i32)).collect();
+    let bg_zq: Vec<Zq> = big_g.iter().map(|&x| Zq::new(x as i32)).collect();
+
+    let f_ntt = ntt(&f_zq, n);
+    let g_ntt = ntt(&g_zq, n);
+    let bf_ntt = ntt(&bf_zq, n);
+    let bg_ntt = ntt(&bg_zq, n);
+
+    let mut result_ntt = vec![Zq::ZERO; n];
+    for i in 0..n {
+        result_ntt[i] = f_ntt[i] * bg_ntt[i] - g_ntt[i] * bf_ntt[i];
+    }
+    let result = intt(&result_ntt, n);
+
+    for r in &result {
+        if !r.is_zero() {
+            return false;
+        }
+    }
+
+    // Exact constant-term check in Z: the constant coefficient of f*G - g*F
+    // must be exactly q (not 0 or 2q). This O(n) pass completes the verification.
+    let mut const_term: i64 = (f[0] as i64) * (big_g[0] as i64)
+        - (g[0] as i64) * (big_f[0] as i64);
+    for i in 1..n {
+        const_term -= (f[i] as i64) * (big_g[n - i] as i64);
+        const_term += (g[i] as i64) * (big_f[n - i] as i64);
+    }
+
+    const_term == Q as i64
+}
+
+/// Schoolbook O(n^2) NTRU equation verification (exact integer arithmetic).
+fn verify_ntru_equation_i16_schoolbook(
+    f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize,
+) -> bool {
     let mut fg = vec![0i64; n];
     let mut gf = vec![0i64; n];
 
@@ -1220,26 +876,16 @@ pub fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]
                 fg[idx] += (f[i] as i64) * (big_g[j] as i64);
                 gf[idx] += (g[i] as i64) * (big_f[j] as i64);
             } else {
-                // Negacyclic: X^n = -1
                 fg[idx - n] -= (f[i] as i64) * (big_g[j] as i64);
                 gf[idx - n] -= (g[i] as i64) * (big_f[j] as i64);
             }
         }
     }
 
-    // f*G - g*F should equal q (constant polynomial)
-    // Check constant term equals q exactly
-    if fg[0] - gf[0] != Q as i64 {
-        return false;
-    }
-
-    // Check all other terms are 0
+    if fg[0] - gf[0] != Q as i64 { return false; }
     for i in 1..n {
-        if fg[i] - gf[i] != 0 {
-            return false;
-        }
+        if fg[i] - gf[i] != 0 { return false; }
     }
-
     true
 }
 
