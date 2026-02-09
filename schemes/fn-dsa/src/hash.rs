@@ -50,76 +50,11 @@ pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     result
 }
 
-/// Computes a domain-separated hash for key generation.
-pub fn hash_for_keygen(seed: &[u8], counter: u32, output_len: usize) -> Vec<u8> {
-    let mut hasher = Shake256::default();
-    hasher.update(b"FALCON-KEYGEN");
-    hasher.update(seed);
-    hasher.update(&counter.to_le_bytes());
-
-    let mut reader = hasher.finalize_xof();
-    let mut output = vec![0u8; output_len];
-    reader.read(&mut output);
-    output
-}
-
 /// Generates a random nonce for signing.
 pub fn generate_nonce<R: rand::RngCore>(rng: &mut R) -> [u8; NONCE_SIZE] {
     let mut nonce = [0u8; NONCE_SIZE];
     rng.fill_bytes(&mut nonce);
     nonce
-}
-
-/// Computes the hash used in signature verification.
-///
-/// This takes the public key hash, nonce, and message and produces
-/// the challenge polynomial c.
-pub fn hash_challenge(
-    pk_hash: &[u8],
-    nonce: &[u8],
-    message: &[u8],
-    params: &Params,
-) -> Vec<Zq> {
-    let mut hasher = Shake256::default();
-    hasher.update(pk_hash);
-    hasher.update(nonce);
-    hasher.update(message);
-
-    let mut reader = hasher.finalize_xof();
-
-    let n = params.n;
-    let mut result = vec![Zq::ZERO; n];
-    let mut buf = [0u8; 2];
-    let mut i = 0;
-
-    while i < n {
-        reader.read(&mut buf);
-
-        let w = ((buf[0] as u32) << 8) | (buf[1] as u32);
-
-        if w < 61445 {
-            let val = (w % (Q as u32)) as i16;
-            result[i] = Zq::from_i16_unchecked(val);
-            i += 1;
-        }
-    }
-
-    result
-}
-
-/// Hashes a public key to a fixed-size digest.
-pub fn hash_public_key(h: &[i16]) -> Vec<u8> {
-    let mut hasher = Shake256::default();
-    hasher.update(b"FALCON-PK");
-
-    for &coeff in h {
-        hasher.update(&coeff.to_le_bytes());
-    }
-
-    let mut reader = hasher.finalize_xof();
-    let mut output = vec![0u8; 32];
-    reader.read(&mut output);
-    output
 }
 
 #[cfg(test)]
@@ -161,16 +96,6 @@ mod tests {
         for coeff in &c {
             assert!(coeff.value() >= 0 && coeff.value() < Q as i16);
         }
-    }
-
-    #[test]
-    fn test_hash_public_key() {
-        let h: Vec<i16> = (0..512).map(|i| (i * 7) as i16 % Q as i16).collect();
-        let hash1 = hash_public_key(&h);
-        let hash2 = hash_public_key(&h);
-
-        assert_eq!(hash1.len(), 32);
-        assert_eq!(hash1, hash2);
     }
 
     #[test]

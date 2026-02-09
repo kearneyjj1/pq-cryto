@@ -197,8 +197,6 @@ fn check_gram_schmidt_quality(gs: &GramSchmidt, params: &Params) -> bool {
 
 /// Computes the Gram-Schmidt orthogonalization of the secret key.
 fn compute_gram_schmidt(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]) -> GramSchmidt {
-    let n = f.len();
-
     // Convert to FFT form
     let mut f_fft: Vec<Complex> = f.iter().map(|&x| Complex::from_real(x as f64)).collect();
     let mut g_fft: Vec<Complex> = g.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -361,7 +359,7 @@ mod tests {
     fn try_keygen_with_n(n: usize, log_n: usize, seed: u64, max_attempts: u32) -> bool {
         use crate::params::Params;
 
-        let params = Params {
+        let _params = Params {
             n,
             log_n,
             sigma: 165.0,
@@ -426,7 +424,7 @@ mod tests {
         for seed in 0..20u64 {
             let mut rng = StdRng::seed_from_u64(seed);
 
-            for attempt in 0..500 {
+            for _attempt in 0..500 {
                 let f = generate_small_poly(&mut rng, n, sigma);
                 let g = generate_small_poly(&mut rng, n, sigma);
 
@@ -442,13 +440,12 @@ mod tests {
                     continue;
                 }
 
-                let (big_f, big_g) = match ntru_solve(&f, &g, n) {
+                let (_big_f, _big_g) = match ntru_solve(&f, &g, n) {
                     Ok(result) => result,
                     Err(_) => continue,
                 };
 
                 if let Ok(_h) = compute_public_key(&f, &g) {
-                    println!("Success at seed={}, attempt {}: NTRU solved, public key computed", seed, attempt);
                     return;
                 }
             }

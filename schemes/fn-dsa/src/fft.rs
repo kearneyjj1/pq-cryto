@@ -272,7 +272,7 @@ impl From<f64> for Complex {
 /// to the leaves where values are purely real.
 ///
 /// Uses iterative bottom-up construction to avoid deep recursion.
-pub fn compute_roots(n: usize) -> Vec<Complex> {
+pub(crate) fn compute_roots(n: usize) -> Vec<Complex> {
     debug_assert!(n.is_power_of_two() && n >= 2);
 
     // Build iteratively from n=2 upward
@@ -505,6 +505,7 @@ pub fn merge_fft(f0: &[Complex], f1: &[Complex]) -> Vec<Complex> {
 // ============================================================================
 
 /// Converts a polynomial from coefficient form to FFT form.
+#[cfg(test)]
 pub fn poly_to_fft(coeffs: &[i16], n: usize) -> Vec<Complex> {
     let mut f: Vec<Complex> = coeffs.iter().map(|&c| Complex::from_real(c as f64)).collect();
     f.resize(n, Complex::ZERO);
@@ -515,6 +516,7 @@ pub fn poly_to_fft(coeffs: &[i16], n: usize) -> Vec<Complex> {
 /// Converts from FFT form back to (approximate) integer coefficients.
 ///
 /// Clamps values to the i16 range to prevent undefined truncation.
+#[cfg(test)]
 pub fn fft_to_poly(fft_coeffs: &[Complex]) -> Vec<i16> {
     let mut f = fft_coeffs.to_vec();
     ifft(&mut f);
@@ -525,35 +527,10 @@ pub fn fft_to_poly(fft_coeffs: &[Complex]) -> Vec<i16> {
 }
 
 /// Multiplies two polynomials in FFT form (pointwise).
+#[cfg(test)]
 pub fn fft_mul(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).collect()
-}
-
-/// Adds two polynomials in FFT form.
-pub fn fft_add(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
-}
-
-/// Subtracts two polynomials in FFT form.
-pub fn fft_sub(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(&x, &y)| x - y).collect()
-}
-
-/// Negates a polynomial in FFT form.
-pub fn fft_neg(a: &[Complex]) -> Vec<Complex> {
-    a.iter().map(|&x| -x).collect()
-}
-
-/// Computes the adjoint (conjugate) of a polynomial in FFT form.
-///
-/// In the Falcon tree ordering, the adjoint is element-wise complex
-/// conjugation. This matches the property that for a real polynomial f,
-/// evaluating f*(x) = f(1/x) * x^n at root w_i gives conj(f(w_i)).
-pub fn fft_adj(a: &[Complex]) -> Vec<Complex> {
-    a.iter().map(|c| c.conj()).collect()
 }
 
 #[cfg(test)]

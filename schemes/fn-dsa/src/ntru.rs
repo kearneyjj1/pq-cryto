@@ -19,7 +19,7 @@ use num_traits::{Zero, One, Signed, ToPrimitive};
 
 /// Extended GCD for integers.
 /// Returns (gcd, x, y) such that a*x + b*y = gcd(a, b).
-pub fn extended_gcd(a: i64, b: i64) -> (i64, i64, i64) {
+fn extended_gcd(a: i64, b: i64) -> (i64, i64, i64) {
     if b == 0 {
         (a.abs(), if a < 0 { -1 } else { 1 }, 0)
     } else {
@@ -263,14 +263,7 @@ fn ntru_solve_float(f: &[i8], g: &[i8], n: usize) -> Result<(Vec<i16>, Vec<i16>)
     let g_big: Vec<BigInt> = g.iter().map(|&x| BigInt::from(x)).collect();
 
     // Use the recursive BigInt algorithm
-    let (big_f_big, big_g_big) = match ntru_solve_recursive_bigint(&f_big, &g_big, n) {
-        Ok(result) => result,
-        Err(e) => {
-            #[cfg(test)]
-            println!("ntru_solve_bigint: recursive solve failed for n={}", n);
-            return Err(e);
-        }
-    };
+    let (big_f_big, big_g_big) = ntru_solve_recursive_bigint(&f_big, &g_big, n)?;
 
     // Convert to i16 (Babai reduction should have made coefficients small)
     let big_f_i16: Vec<i16> = big_f_big.iter().map(|x| {
@@ -285,28 +278,8 @@ fn ntru_solve_float(f: &[i8], g: &[i8], n: usize) -> Result<(Vec<i16>, Vec<i16>)
         })
     }).collect();
 
-    #[cfg(test)]
-    {
-        let f_max = big_f_big.iter().map(|x| x.abs()).max().unwrap_or(BigInt::zero());
-        let g_max = big_g_big.iter().map(|x| x.abs()).max().unwrap_or(BigInt::zero());
-        if n >= 128 {
-            println!("ntru_solve_bigint n={}: F_max={}, G_max={}", n, f_max, g_max);
-        }
-    }
-
     // Verify the solution
-    let verified = verify_ntru_equation_i16(f, g, &big_f_i16, &big_g_i16, n);
-
-    #[cfg(test)]
-    {
-        if n >= 128 {
-            println!("ntru_solve_bigint n={}: verified={}", n, verified);
-        }
-    }
-
-    if !verified {
-        #[cfg(test)]
-        println!("ntru_solve_bigint: verification failed for n={}", n);
+    if !verify_ntru_equation_i16(f, g, &big_f_i16, &big_g_i16, n) {
         return Err(FnDsaError::NtruSolveFailed);
     }
 
@@ -362,18 +335,6 @@ fn ntru_solve_recursive_bigint(f: &[BigInt], g: &[BigInt], n: usize) -> Result<(
     // Recursive case: compute field norms and recurse
     let f_prime = field_norm_bigint(f);
     let g_prime = field_norm_bigint(g);
-
-    #[cfg(test)]
-    {
-        if n >= 64 {
-            let f_prime_max = f_prime.iter().map(|x| x.abs()).max().unwrap_or(BigInt::zero());
-            let g_prime_max = g_prime.iter().map(|x| x.abs()).max().unwrap_or(BigInt::zero());
-            println!("Recursion n={}: field norms max bits = ({}, {})",
-                n,
-                f_prime_max.bits(),
-                g_prime_max.bits());
-        }
-    }
 
     // Recursively solve in the smaller ring
     let (big_f_prime, big_g_prime) = ntru_solve_recursive_bigint(&f_prime, &g_prime, n / 2)?;
@@ -777,52 +738,12 @@ fn babai_reduce_coefficients(
     (big_f_reduced, big_g_reduced)
 }
 
-/// Verifies that f*G - g*F = q (with i8 coefficients for F, G).
-/// Uses exact integer arithmetic to verify the NTRU equation.
-pub fn verify_ntru_equation(f: &[i8], g: &[i8], big_f: &[i8], big_g: &[i8], n: usize) -> bool {
-    // Compute f*G - g*F in Z[X]/(X^n + 1) using exact integer arithmetic
-    // The result should be the constant polynomial q.
-
-    // Compute the negacyclic convolution f*G and g*F
-    let mut fg = vec![0i64; n];
-    let mut gf = vec![0i64; n];
-
-    for i in 0..n {
-        for j in 0..n {
-            let idx = i + j;
-            if idx < n {
-                fg[idx] += (f[i] as i64) * (big_g[j] as i64);
-                gf[idx] += (g[i] as i64) * (big_f[j] as i64);
-            } else {
-                // Negacyclic: X^n = -1
-                fg[idx - n] -= (f[i] as i64) * (big_g[j] as i64);
-                gf[idx - n] -= (g[i] as i64) * (big_f[j] as i64);
-            }
-        }
-    }
-
-    // f*G - g*F should equal q (constant polynomial)
-    // Check constant term equals q exactly
-    if fg[0] - gf[0] != Q as i64 {
-        return false;
-    }
-
-    // Check all other terms are 0
-    for i in 1..n {
-        if fg[i] - gf[i] != 0 {
-            return false;
-        }
-    }
-
-    true
-}
-
 /// Verifies that f*G - g*F = q (with i16 coefficients for F, G).
 ///
 /// For n <= 32, uses exact O(n^2) schoolbook arithmetic.
 /// For larger n, uses NTT mod q (O(n log n)) as a necessary condition check,
 /// plus an exact O(n) constant-term computation to confirm the result is q.
-pub fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
+fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
     if n <= 32 {
         return verify_ntru_equation_i16_schoolbook(f, g, big_f, big_g, n);
     }
@@ -933,10 +854,6 @@ pub fn compute_public_key(f: &[i8], g: &[i8], n: usize) -> Result<Vec<i16>> {
 
     for i in 0..n {
         if hf[i] != g_zq[i] {
-            #[cfg(debug_assertions)]
-            {
-                eprintln!("h*f != g at index {}: h*f={}, g={}", i, hf[i].value(), g_zq[i].value());
-            }
             return Err(FnDsaError::KeygenFailed {
                 reason: "h*f != g verification failed",
             });
@@ -944,35 +861,6 @@ pub fn compute_public_key(f: &[i8], g: &[i8], n: usize) -> Result<Vec<i16>> {
     }
 
     Ok(h)
-}
-
-/// Computes the Gram matrix [[f, g], [F, G]]^T * [[f, g], [F, G]].
-pub fn compute_gram_matrix(
-    f_fft: &[Complex],
-    g_fft: &[Complex],
-    big_f_fft: &[Complex],
-    big_g_fft: &[Complex],
-) -> (Vec<Complex>, Vec<Complex>, Vec<Complex>, Vec<Complex>) {
-    let n = f_fft.len();
-
-    let mut entry_00 = Vec::with_capacity(n);
-    let mut entry_01 = Vec::with_capacity(n);
-    let mut entry_10 = Vec::with_capacity(n);
-    let mut entry_11 = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let f = f_fft[i];
-        let g = g_fft[i];
-        let big_f = big_f_fft[i];
-        let big_g = big_g_fft[i];
-
-        entry_00.push(f * f.conj() + g * g.conj());
-        entry_01.push(f * big_f.conj() + g * big_g.conj());
-        entry_10.push(big_f * f.conj() + big_g * g.conj());
-        entry_11.push(big_f * big_f.conj() + big_g * big_g.conj());
-    }
-
-    (entry_00, entry_01, entry_10, entry_11)
 }
 
 #[cfg(test)]
@@ -1079,8 +967,6 @@ mod tests {
 
         match result {
             Ok((big_f, big_g)) => {
-                println!("n=4: F = {:?}", big_f);
-                println!("n=4: G = {:?}", big_g);
                 let check = verify_ntru_equation_i16(&f, &g, &big_f, &big_g, 4);
                 assert!(check, "Should satisfy NTRU equation for n=4");
             }
@@ -1100,8 +986,6 @@ mod tests {
 
         match result {
             Ok((big_f, big_g)) => {
-                println!("n=8: F = {:?}", big_f);
-                println!("n=8: G = {:?}", big_g);
                 let check = verify_ntru_equation_i16(&f, &g, &big_f, &big_g, 8);
                 assert!(check, "Should satisfy NTRU equation for n=8");
             }
@@ -1124,13 +1008,11 @@ mod tests {
 
         match result {
             Ok((big_f, big_g)) => {
-                println!("n={}: F max coeff = {}", n, big_f.iter().map(|&x| x.abs()).max().unwrap());
-                println!("n={}: G max coeff = {}", n, big_g.iter().map(|&x| x.abs()).max().unwrap());
                 let check = verify_ntru_equation_i16(&f, &g, &big_f, &big_g, n);
                 assert!(check, "Should satisfy NTRU equation for n={}", n);
             }
-            Err(e) => {
-                println!("n={}: NTRUSolve failed: {:?}", n, e);
+            Err(_) => {
+                // Simple polynomials may not always solve at large n
             }
         }
     }
@@ -1148,14 +1030,11 @@ mod tests {
 
         match result {
             Ok((big_f, big_g)) => {
-                println!("n={}: F max coeff = {}", n, big_f.iter().map(|&x| x.abs()).max().unwrap());
-                println!("n={}: G max coeff = {}", n, big_g.iter().map(|&x| x.abs()).max().unwrap());
                 let check = verify_ntru_equation_i16(&f, &g, &big_f, &big_g, n);
                 assert!(check, "Should satisfy NTRU equation for n={}", n);
-                println!("n={}: NTRUSolve SUCCESS!", n);
             }
-            Err(e) => {
-                println!("n={}: NTRUSolve failed: {:?}", n, e);
+            Err(_) => {
+                // Simple polynomials may not always solve at n=512
             }
         }
     }
@@ -1175,24 +1054,15 @@ mod tests {
         }).collect();
         let g: Vec<i8> = (0..n).map(|_| (rng.gen::<u32>() % 5) as i8 - 2).collect();
 
-        println!("Testing NTRUSolve with random f, g...");
-        println!("f max = {}, g max = {}", f.iter().map(|&x| x.abs()).max().unwrap(), g.iter().map(|&x| x.abs()).max().unwrap());
-
         let result = ntru_solve(&f, &g, n);
 
         match result {
             Ok((big_f, big_g)) => {
-                println!("n={}: F max coeff = {}", n, big_f.iter().map(|&x| x.abs()).max().unwrap());
-                println!("n={}: G max coeff = {}", n, big_g.iter().map(|&x| x.abs()).max().unwrap());
                 let check = verify_ntru_equation_i16(&f, &g, &big_f, &big_g, n);
-                if check {
-                    println!("n={}: NTRUSolve SUCCESS with random polynomials!", n);
-                } else {
-                    println!("n={}: Verification failed after rounding", n);
-                }
+                assert!(check, "Should satisfy NTRU equation for n={} with random polynomials", n);
             }
-            Err(e) => {
-                println!("n={}: NTRUSolve failed with random polynomials: {:?}", n, e);
+            Err(_) => {
+                // Random polynomials may not always be solvable
             }
         }
     }

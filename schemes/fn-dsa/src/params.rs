@@ -12,9 +12,6 @@
 /// The 2n-th roots of unity exist in Z_q for n up to 1024.
 pub const Q: i32 = 12289;
 
-/// Log2 of the modulus (for bit operations).
-pub const Q_BITS: usize = 14;
-
 /// Parameters for the FN-DSA (FALCON) signature scheme.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -54,25 +51,6 @@ pub struct Params {
     pub security_level: usize,
 }
 
-impl Params {
-    /// Returns the polynomial degree n.
-    #[inline]
-    pub const fn n(&self) -> usize {
-        self.n
-    }
-
-    /// Returns the number of coefficients in the upper triangular representation.
-    #[inline]
-    pub const fn ut_size(&self) -> usize {
-        self.n * (self.n + 1) / 2
-    }
-
-    /// Computes the signature norm bound for verification.
-    #[inline]
-    pub fn sig_bound(&self) -> f64 {
-        self.sig_bound_sq.sqrt()
-    }
-}
 
 /// FALCON-512 parameters (NIST Level 1, ~128-bit security).
 ///
@@ -147,10 +125,6 @@ pub const FALCON_16: Params = Params {
     security_level: 0, // Not secure
 };
 
-/// Beta parameter for signature compression.
-/// Used in the Golomb-Rice style encoding.
-pub const BETA: f64 = 0.5;
-
 /// Maximum number of signing attempts before giving up.
 /// With proper ffSampling, signing typically succeeds within a few attempts.
 pub const MAX_SIGN_ATTEMPTS: u32 = 100;
@@ -206,16 +180,4 @@ mod tests {
         assert_eq!(1 << FALCON_1024.log_n, FALCON_1024.n);
     }
 
-    #[test]
-    fn test_sig_bound() {
-        // Check that sig_bound is reasonable (should be around sqrt(sig_bound_sq))
-        let bound_512 = FALCON_512.sig_bound();
-        let bound_1024 = FALCON_1024.sig_bound();
-
-        // FALCON-512: sqrt(34034726) ≈ 5834
-        assert!(bound_512 > 5800.0 && bound_512 < 5900.0);
-
-        // FALCON-1024: sqrt(70265242) ≈ 8382
-        assert!(bound_1024 > 8300.0 && bound_1024 < 8400.0);
-    }
 }
