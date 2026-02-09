@@ -29,7 +29,9 @@
 //!   s1 = c - z0·g - z1·G  =  c - s2·h   (since h = g·f⁻¹ mod q)
 //! ```
 
-use crate::fft::{ifft, merge_fft, split_fft, Complex};
+use crate::fft::{merge_fft, split_fft, Complex};
+#[cfg(test)]
+use crate::fft::ifft;
 use crate::fft_tree::GramSchmidt;
 use crate::gaussian::SamplerZ;
 use rand::RngCore;
@@ -206,10 +208,12 @@ impl<'a> FfSampler<'a> {
 ///
 /// This sampler doesn't use the full FFT tree but still produces
 /// valid lattice samples (with potentially larger norms).
+#[cfg(test)]
 pub struct SimpleSampler {
     sampler_z: SamplerZ,
 }
 
+#[cfg(test)]
 impl SimpleSampler {
     /// Creates a new simple sampler.
     pub fn new() -> Self {
@@ -236,56 +240,17 @@ impl SimpleSampler {
     }
 }
 
+#[cfg(test)]
 impl Default for SimpleSampler {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Computes the signature from the sampled lattice point (alternative formulation).
-///
-/// This uses the column-vector convention `B·z` with basis `B = [[g, -f], [G, -F]]`,
-/// where `t` is the first component of the target `(c, 0)`. Given `(z0, z1)`:
-///
-/// ```text
-///   s1 = t - z0·f - z1·F       (equivalent to c - z0·g - z1·G via NTRU relation)
-///   s2 = -(z0·g + z1·G)        (equivalent to z0·f + z1·F mod q)
-/// ```
-///
-/// Both formulations produce algebraically equivalent results mod q because
-/// `fG ≡ gF (mod q)` implies `(z0·f + z1·F)·h ≡ z0·g + z1·G (mod q)`.
-///
-/// Note: The main `sign()` function in `sign.rs` uses the simpler `s2 = z0·f + z1·F`
-/// formulation directly. This function is provided for reference/testing.
-pub fn compute_signature(
-    z0_fft: &[Complex],
-    z1_fft: &[Complex],
-    f_fft: &[Complex],
-    g_fft: &[Complex],
-    big_f_fft: &[Complex],
-    big_g_fft: &[Complex],
-    t_fft: &[Complex],
-) -> (Vec<Complex>, Vec<Complex>) {
-    let n = z0_fft.len();
-
-    // s1 = t - z0·f - z1·F
-    let mut s1_fft = Vec::with_capacity(n);
-    for i in 0..n {
-        s1_fft.push(t_fft[i] - z0_fft[i] * f_fft[i] - z1_fft[i] * big_f_fft[i]);
-    }
-
-    // s2 = -(z0·g + z1·G) ≡ z0·f + z1·F (mod q)
-    let mut s2_fft = Vec::with_capacity(n);
-    for i in 0..n {
-        s2_fft.push(-z0_fft[i] * g_fft[i] - z1_fft[i] * big_g_fft[i]);
-    }
-
-    (s1_fft, s2_fft)
-}
-
 /// Verifies that the signature has an acceptable norm.
 ///
 /// The norm of (s1, s2) should be below the bound for the given parameters.
+#[cfg(test)]
 pub fn check_signature_norm(
     s1_fft: &[Complex],
     s2_fft: &[Complex],
@@ -372,7 +337,7 @@ mod tests {
     #[test]
     fn test_check_signature_norm() {
         // Create a signature with known norm
-        let n = 4;
+        let _n = 4;
         let mut s1: Vec<Complex> = vec![1.0, 2.0, 3.0, 4.0]
             .into_iter()
             .map(|x| Complex::from_real(x))

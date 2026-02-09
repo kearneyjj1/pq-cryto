@@ -268,6 +268,7 @@ impl BaseSampler {
     ///
     /// Returns a signed integer `z` with `P(z) ∝ exp(-z²/(2σ₀²))`.
     /// Uses 72-bit precision RCDT with constant-time comparison.
+    #[cfg(test)]
     pub fn sample<R: RngCore>(&self, rng: &mut R) -> i64 {
         let z = self.sample_half(rng);
 

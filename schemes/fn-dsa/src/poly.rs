@@ -3,7 +3,7 @@
 //! This module provides polynomial operations in the ring Z_q[X]/(X^n + 1)
 //! where q = 12289 and n is 512 or 1024.
 
-use crate::fft::{fft, fft_add, fft_mul, fft_sub, ifft, Complex};
+use crate::fft::{fft, ifft, Complex};
 use crate::field::Zq;
 use crate::params::Q;
 use zeroize::Zeroize;
@@ -38,13 +38,6 @@ impl Poly {
         }
     }
 
-    /// Creates a polynomial from i8 coefficients (for small polynomials like f, g).
-    pub fn from_i8(coeffs: &[i8]) -> Self {
-        Poly {
-            coeffs: coeffs.iter().map(|&c| Zq::new(c as i32)).collect(),
-        }
-    }
-
     /// Creates a polynomial from Zq coefficients.
     pub fn from_zq(coeffs: Vec<Zq>) -> Self {
         Poly { coeffs }
@@ -54,12 +47,6 @@ impl Poly {
     #[inline]
     pub fn len(&self) -> usize {
         self.coeffs.len()
-    }
-
-    /// Returns true if the polynomial is empty (shouldn't happen in practice).
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.coeffs.is_empty()
     }
 
     /// Returns true if all coefficients are zero.
@@ -224,33 +211,28 @@ impl Poly {
 }
 
 // ============================================================================
-// Polynomial FFT Representation
+// Polynomial FFT Representation (test-only)
 // ============================================================================
 
 /// A polynomial in FFT form (evaluated at the n-th roots of -1).
 ///
 /// Operations in FFT form are pointwise and thus O(n) instead of O(n^2).
+/// Only used in tests — production code works directly with `Vec<Complex>`.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct PolyFft {
-    /// FFT coefficients (complex evaluations).
     pub coeffs: Vec<Complex>,
 }
 
+#[cfg(test)]
 impl Drop for PolyFft {
     fn drop(&mut self) {
         self.coeffs.zeroize();
     }
 }
 
+#[cfg(test)]
 impl PolyFft {
-    /// Creates a zero polynomial in FFT form.
-    pub fn zero(n: usize) -> Self {
-        PolyFft {
-            coeffs: vec![Complex::ZERO; n],
-        }
-    }
-
-    /// Converts a polynomial to FFT form.
     pub fn from_poly(p: &Poly) -> Self {
         let mut coeffs: Vec<Complex> = p
             .coeffs
@@ -261,27 +243,6 @@ impl PolyFft {
         PolyFft { coeffs }
     }
 
-    /// Converts from i8 coefficients directly to FFT form.
-    pub fn from_i8(coeffs: &[i8]) -> Self {
-        let mut fft_coeffs: Vec<Complex> =
-            coeffs.iter().map(|&c| Complex::from_real(c as f64)).collect();
-        fft(&mut fft_coeffs);
-        PolyFft { coeffs: fft_coeffs }
-    }
-
-    /// Converts from f64 coefficients directly to FFT form.
-    pub fn from_f64(coeffs: &[f64]) -> Self {
-        let mut fft_coeffs: Vec<Complex> =
-            coeffs.iter().map(|&c| Complex::from_real(c)).collect();
-        fft(&mut fft_coeffs);
-        PolyFft { coeffs: fft_coeffs }
-    }
-
-    /// Converts back to a polynomial (rounds coefficients).
-    ///
-    /// # Safety
-    ///
-    /// Uses clamping to prevent integer overflow when converting from f64 to i32.
     pub fn to_poly(&self) -> Poly {
         let mut coeffs = self.coeffs.clone();
         ifft(&mut coeffs);
@@ -290,7 +251,6 @@ impl PolyFft {
                 .iter()
                 .map(|c| {
                     let rounded = c.re.round();
-                    // Clamp to i32 range to prevent overflow on cast
                     let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
                     Zq::new(clamped)
                 })
@@ -298,72 +258,19 @@ impl PolyFft {
         }
     }
 
-    /// Converts to f64 coefficients (no modular reduction).
-    pub fn to_f64(&self) -> Vec<f64> {
-        let mut coeffs = self.coeffs.clone();
-        ifft(&mut coeffs);
-        coeffs.iter().map(|c| c.re).collect()
-    }
-
-    /// Returns the number of coefficients.
-    #[inline]
     pub fn len(&self) -> usize {
         self.coeffs.len()
     }
 
-    /// Returns true if empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.coeffs.is_empty()
-    }
-
-    /// Adds two polynomials in FFT form (pointwise).
-    pub fn add(&self, other: &PolyFft) -> PolyFft {
-        PolyFft {
-            coeffs: fft_add(&self.coeffs, &other.coeffs),
-        }
-    }
-
-    /// Subtracts two polynomials in FFT form (pointwise).
-    pub fn sub(&self, other: &PolyFft) -> PolyFft {
-        PolyFft {
-            coeffs: fft_sub(&self.coeffs, &other.coeffs),
-        }
-    }
-
-    /// Multiplies two polynomials in FFT form (pointwise).
     pub fn mul(&self, other: &PolyFft) -> PolyFft {
         PolyFft {
-            coeffs: fft_mul(&self.coeffs, &other.coeffs),
+            coeffs: self.coeffs.iter().zip(other.coeffs.iter()).map(|(&x, &y)| x * y).collect(),
         }
     }
 
-    /// Negates the polynomial in FFT form.
-    pub fn neg(&self) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|&c| -c).collect(),
-        }
-    }
-
-    /// Scales by a real number.
-    pub fn scale(&self, s: f64) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|c| c.scale(s)).collect(),
-        }
-    }
-
-    /// Computes the adjoint (conjugate of coefficients).
-    /// In the ring Z[X]/(X^n + 1), the adjoint of f(x) is f(1/x) * x^n.
     pub fn adj(&self) -> PolyFft {
         PolyFft {
             coeffs: self.coeffs.iter().map(|c| c.conj()).collect(),
-        }
-    }
-
-    /// Computes self * self.adj() = |self|^2 in FFT form.
-    pub fn norm_sq_fft(&self) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|c| Complex::from_real(c.norm_sq())).collect(),
         }
     }
 }
@@ -604,7 +511,7 @@ mod tests {
     fn test_poly_mul_simple() {
         // (1 + x) * (1 - x) = 1 - x^2 in normal polynomial ring
         // But in Z[X]/(X^n + 1), we need to consider wrapping
-        let n = 4;
+        let _n = 4;
         let a = Poly::from_i16(&[1, 1, 0, 0]);
         let b = Poly::from_i16(&[1, -1 + Q as i16, 0, 0]); // 1 - x, using positive representation
         let c = a.mul(&b);

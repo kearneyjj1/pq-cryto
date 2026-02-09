@@ -142,19 +142,6 @@ pub fn reduce(val: i32) -> i16 {
     r as i16
 }
 
-/// Reduces a 64-bit value modulo q.
-///
-/// Constant-time: branchless conditional add via arithmetic shift mask.
-#[inline]
-pub fn reduce64(val: i64) -> i16 {
-    let q = Q as i64;
-    let mut r = val % q;
-    // Branchless: if r < 0, add q
-    let neg_mask = r >> 63; // all-1s if r < 0
-    r += q & neg_mask;
-    r as i16
-}
-
 impl Add for Zq {
     type Output = Zq;
 

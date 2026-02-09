@@ -264,8 +264,6 @@ pub fn decode_secret_key(bytes: &[u8]) -> Result<SecretKey> {
 fn compute_gram_schmidt(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16]) -> GramSchmidt {
     use crate::fft::fft;
 
-    let n = f.len();
-
     let mut f_fft: Vec<Complex> = f.iter().map(|&x| Complex::from_real(x as f64)).collect();
     let mut g_fft: Vec<Complex> = g.iter().map(|&x| Complex::from_real(x as f64)).collect();
     let mut big_f_fft: Vec<Complex> = big_f.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -574,12 +572,107 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
     Ok((Signature { nonce, s2 }, n))
 }
 
+/// Decodes Golomb-Rice encoded coefficients from a bitstream.
+///
+/// Shared decoder used by both FIPS 206 and compressed signature formats.
+/// Reads `n` coefficients from `data` using Golomb-Rice coding with parameter `k`.
+fn decode_golomb_rice(data: &[u8], n: usize, k: usize) -> Result<Vec<i16>> {
+    let k_mask = (1u64 << k) - 1;
+    let max_coeff = (crate::params::Q / 2) as i16;
+
+    let mut s2 = Vec::with_capacity(n);
+    let mut bit_buffer: u64 = 0;
+    let mut bit_count: usize = 0;
+    let mut byte_idx: usize = 0;
+
+    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
+        while *bc < need && *bi < data.len() {
+            *buf |= (data[*bi] as u64) << *bc;
+            *bc += 8;
+            *bi += 1;
+        }
+    };
+
+    for _ in 0..n {
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+        if bit_count < 1 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "truncated signature data",
+            });
+        }
+        let nonzero = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        if nonzero == 0 {
+            s2.push(0i16);
+            continue;
+        }
+
+        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
+        if bit_count < 1 + k {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "truncated signature data",
+            });
+        }
+        let sign = bit_buffer & 1;
+        bit_buffer >>= 1;
+        bit_count -= 1;
+
+        let low = bit_buffer & k_mask;
+        bit_buffer >>= k;
+        bit_count -= k;
+
+        let mut high: u64 = 0;
+        loop {
+            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
+            if bit_count < 1 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "truncated unary in signature data",
+                });
+            }
+            let bit = bit_buffer & 1;
+            bit_buffer >>= 1;
+            bit_count -= 1;
+            if bit == 1 {
+                break;
+            }
+            high += 1;
+            if high > 64 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "unary overflow in signature data",
+                });
+            }
+        }
+
+        let combined = (high << k) | low;
+        if combined >= i16::MAX as u64 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient exceeds i16 range",
+            });
+        }
+        let abs_val = (combined as i16) + 1;
+        if abs_val > max_coeff {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "s2 coefficient out of range",
+            });
+        }
+        let coeff = if sign == 1 { -abs_val } else { abs_val };
+        s2.push(coeff);
+    }
+
+    Ok(s2)
+}
+
 /// Decodes a FIPS 206 format signature (header byte + nonce + Golomb-Rice).
 fn decode_signature_fips206(bytes: &[u8], n: usize) -> Result<(Signature, usize)> {
-    let k = rice_k_for_n(n);
-    let k_mask = (1u64 << k) - 1;
     let header_len = 1 + NONCE_SIZE;
-
     if bytes.len() < header_len {
         return Err(FnDsaError::InvalidInput {
             field: "signature",
@@ -590,107 +683,15 @@ fn decode_signature_fips206(bytes: &[u8], n: usize) -> Result<(Signature, usize)
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&bytes[1..1 + NONCE_SIZE]);
 
-    let mut s2 = Vec::with_capacity(n);
-    let data = &bytes[header_len..];
-
-    let mut bit_buffer: u64 = 0;
-    let mut bit_count: usize = 0;
-    let mut byte_idx: usize = 0;
-
-    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
-        while *bc < need && *bi < data.len() {
-            *buf |= (data[*bi] as u64) << *bc;
-            *bc += 8;
-            *bi += 1;
-        }
-    };
-
-    let max_coeff = (crate::params::Q / 2) as i16;
-
-    for _ in 0..n {
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-        if bit_count < 1 {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "truncated FIPS 206 signature data",
-            });
-        }
-        let nonzero = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        if nonzero == 0 {
-            s2.push(0i16);
-            continue;
-        }
-
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
-        if bit_count < 1 + k {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "truncated FIPS 206 signature data",
-            });
-        }
-        let sign = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        let low = bit_buffer & k_mask;
-        bit_buffer >>= k;
-        bit_count -= k;
-
-        let mut high: u64 = 0;
-        loop {
-            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-            if bit_count < 1 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "signature",
-                    reason: "truncated unary in FIPS 206 signature",
-                });
-            }
-            let bit = bit_buffer & 1;
-            bit_buffer >>= 1;
-            bit_count -= 1;
-            if bit == 1 {
-                break;
-            }
-            high += 1;
-            if high > 64 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "signature",
-                    reason: "unary overflow in FIPS 206 signature",
-                });
-            }
-        }
-
-        // Check u64 magnitude before casting to i16 to prevent silent truncation
-        let combined = (high << k) | low;
-        if combined >= i16::MAX as u64 {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "s2 coefficient exceeds i16 range",
-            });
-        }
-        let abs_val = (combined as i16) + 1;
-        if abs_val > max_coeff {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "s2 coefficient out of range",
-            });
-        }
-        let coeff = if sign == 1 { -abs_val } else { abs_val };
-        s2.push(coeff);
-    }
+    let k = rice_k_for_n(n);
+    let s2 = decode_golomb_rice(&bytes[header_len..], n, k)?;
 
     Ok((Signature { nonce, s2 }, n))
 }
 
 /// Decodes a Golomb-Rice compressed signature.
 fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usize)> {
-    let k = rice_k_for_n(n);
-    let k_mask = (1u64 << k) - 1;
     let header_len = 6 + NONCE_SIZE;
-
     if bytes.len() < header_len {
         return Err(FnDsaError::InvalidInput {
             field: "signature",
@@ -698,107 +699,11 @@ fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usi
         });
     }
 
-    // Read nonce
     let mut nonce = [0u8; NONCE_SIZE];
     nonce.copy_from_slice(&bytes[6..6 + NONCE_SIZE]);
 
-    // Decode s2 using Golomb-Rice bit unpacking
-    let mut s2 = Vec::with_capacity(n);
-    let data = &bytes[header_len..];
-
-    let mut bit_buffer: u64 = 0;
-    let mut bit_count: usize = 0;
-    let mut byte_idx: usize = 0;
-
-    // Helper: ensure at least `need` bits are buffered
-    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
-        while *bc < need && *bi < data.len() {
-            *buf |= (data[*bi] as u64) << *bc;
-            *bc += 8;
-            *bi += 1;
-        }
-    };
-
-    let max_coeff = (crate::params::Q / 2) as i16;
-
-    for _ in 0..n {
-        // Read zero flag (1 bit)
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-        if bit_count < 1 {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "truncated compressed data",
-            });
-        }
-        let nonzero = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        if nonzero == 0 {
-            s2.push(0i16);
-            continue;
-        }
-
-        // Read sign (1 bit) + low (k bits) = 1 + k bits
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
-        if bit_count < 1 + k {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "truncated compressed data",
-            });
-        }
-        let sign = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        let low = bit_buffer & k_mask;
-        bit_buffer >>= k;
-        bit_count -= k;
-
-        // Read unary: count zeros until a 1
-        let mut high: u64 = 0;
-        loop {
-            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-            if bit_count < 1 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "signature",
-                    reason: "truncated unary in compressed data",
-                });
-            }
-            let bit = bit_buffer & 1;
-            bit_buffer >>= 1;
-            bit_count -= 1;
-            if bit == 1 {
-                break;
-            }
-            high += 1;
-            // Safety limit: high should never exceed a few bits for valid signatures
-            if high > 64 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "signature",
-                    reason: "unary overflow in compressed data",
-                });
-            }
-        }
-
-        // Check u64 magnitude before casting to i16 to prevent silent truncation
-        let combined = (high << k) | low;
-        if combined >= i16::MAX as u64 {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "s2 coefficient exceeds i16 range",
-            });
-        }
-        let abs_val = (combined as i16) + 1;
-        if abs_val > max_coeff {
-            return Err(FnDsaError::InvalidInput {
-                field: "signature",
-                reason: "s2 coefficient out of range",
-            });
-        }
-        let coeff = if sign == 1 { -abs_val } else { abs_val };
-        s2.push(coeff);
-    }
+    let k = rice_k_for_n(n);
+    let s2 = decode_golomb_rice(&bytes[header_len..], n, k)?;
 
     Ok((Signature { nonce, s2 }, n))
 }
@@ -995,106 +900,6 @@ pub fn parse_nist_signed_message(sm: &[u8], mlen: usize) -> Result<(Vec<u8>, Sig
     let s2 = decode_falcon_comp(compressed, n)?;
 
     Ok((message, Signature { nonce, s2 }))
-}
-
-/// Decodes Golomb-Rice compressed s2 coefficients from raw byte data.
-///
-/// This is the core decompression shared between FIPS 206 and original Falcon formats.
-/// The encoding is identical; only the header byte value differs.
-fn decode_golomb_rice_coefficients(data: &[u8], n: usize) -> Result<Vec<i16>> {
-    let k = rice_k_for_n(n);
-    let k_mask = (1u64 << k) - 1;
-
-    let mut s2 = Vec::with_capacity(n);
-    let mut bit_buffer: u64 = 0;
-    let mut bit_count: usize = 0;
-    let mut byte_idx: usize = 0;
-
-    let refill = |buf: &mut u64, bc: &mut usize, bi: &mut usize, need: usize| {
-        while *bc < need && *bi < data.len() {
-            *buf |= (data[*bi] as u64) << *bc;
-            *bc += 8;
-            *bi += 1;
-        }
-    };
-
-    let max_coeff = (crate::params::Q / 2) as i16;
-
-    for _ in 0..n {
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-        if bit_count < 1 {
-            return Err(FnDsaError::InvalidInput {
-                field: "compressed_s2",
-                reason: "truncated coefficient data",
-            });
-        }
-        let nonzero = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        if nonzero == 0 {
-            s2.push(0i16);
-            continue;
-        }
-
-        refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1 + k);
-        if bit_count < 1 + k {
-            return Err(FnDsaError::InvalidInput {
-                field: "compressed_s2",
-                reason: "truncated coefficient data",
-            });
-        }
-        let sign = bit_buffer & 1;
-        bit_buffer >>= 1;
-        bit_count -= 1;
-
-        let low = bit_buffer & k_mask;
-        bit_buffer >>= k;
-        bit_count -= k;
-
-        let mut high: u64 = 0;
-        loop {
-            refill(&mut bit_buffer, &mut bit_count, &mut byte_idx, 1);
-            if bit_count < 1 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "compressed_s2",
-                    reason: "truncated unary in coefficient data",
-                });
-            }
-            let bit = bit_buffer & 1;
-            bit_buffer >>= 1;
-            bit_count -= 1;
-            if bit == 1 {
-                break;
-            }
-            high += 1;
-            if high > 64 {
-                return Err(FnDsaError::InvalidInput {
-                    field: "compressed_s2",
-                    reason: "unary overflow in coefficient data",
-                });
-            }
-        }
-
-        let combined = (high << k) | low;
-        if combined >= i16::MAX as u64 {
-            return Err(FnDsaError::InvalidInput {
-                field: "compressed_s2",
-                reason: "s2 coefficient exceeds i16 range",
-            });
-        }
-        let abs_val = (combined as i16) + 1;
-        if abs_val > max_coeff {
-            return Err(FnDsaError::InvalidInput {
-                field: "compressed_s2",
-                reason: "s2 coefficient out of range",
-            });
-        }
-        let coeff = if sign == 1 { -abs_val } else { abs_val };
-        s2.push(coeff);
-    }
-
-    Ok(s2)
 }
 
 /// Decodes signature coefficients using the original Falcon compression format.

@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_build_from_basis() {
         // Create simple test polynomials in FFT form
-        let n = 4;
+        let _n = 4;
         let mut f: Vec<Complex> = vec![1.0, 0.0, 0.0, 0.0]
             .into_iter()
             .map(|x| Complex::from_real(x))

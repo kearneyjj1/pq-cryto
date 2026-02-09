@@ -40,15 +40,15 @@
 #![warn(rust_2018_idioms)]
 
 pub mod error;
-pub mod fft;
+pub(crate) mod fft;
 pub mod fft_tree;
-pub mod field;
+pub(crate) mod field;
 pub(crate) mod gaussian;
 pub mod hash;
 pub mod keygen;
 pub(crate) mod ntru;
 pub mod params;
-pub mod poly;
+pub(crate) mod poly;
 pub(crate) mod sampler;
 pub mod sign;
 pub mod verify;
@@ -68,7 +68,6 @@ pub use packing::{
     encode_secret_key, decode_secret_key,
     encode_signature, decode_signature,
     encode_signature_raw, encode_signature_compressed,
-    encode_keypair, decode_keypair,
     decode_nist_public_key, parse_nist_signed_message,
     to_hex, from_hex,
 };
