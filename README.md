@@ -129,21 +129,21 @@ pq-crypto/
 Each scheme is a separate Cargo workspace member:
 
 ```bash
-# Build all schemes
-cd schemes/ml-dsa && cargo build
-cd schemes/fn-dsa && cargo build
-cd schemes/uov && cargo build
+# Build all schemes (run each from the repo root)
+(cd schemes/ml-dsa && cargo build)
+(cd schemes/fn-dsa && cargo build)
+(cd schemes/uov && cargo build)
 
-# Run tests
-cd schemes/ml-dsa && cargo test
-cd schemes/fn-dsa && cargo test
-cd schemes/uov && cargo test
+# Run tests (run each from the repo root)
+(cd schemes/ml-dsa && cargo test)
+(cd schemes/fn-dsa && cargo test)
+(cd schemes/uov && cargo test)
 
 # Run FALCON-512 KAT verification (100 vectors)
-cd schemes/fn-dsa && cargo test --release --test kat_falcon512
+(cd schemes/fn-dsa && cargo test --release --test kat_falcon512)
 
-# Run with optimizations (recommended)
-cargo test --release
+# Run a specific scheme's tests with optimizations
+(cd schemes/fn-dsa && cargo test --release)
 ```
 
 ## Test Coverage

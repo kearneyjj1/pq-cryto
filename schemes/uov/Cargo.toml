@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "UOV (Unbalanced Oil and Vinegar) post-quantum signature scheme implementation"
 license = "MIT"
-repository = "https://github.com/jkearney/pq-cryto"
+repository = "https://github.com/kearneyjj1/pq-cryto"
 keywords = ["cryptography", "post-quantum", "signature", "uov"]
 categories = ["cryptography"]
 

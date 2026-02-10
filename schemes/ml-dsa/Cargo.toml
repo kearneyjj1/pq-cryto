@@ -6,6 +6,7 @@ description = "ML-DSA (Module-Lattice Digital Signature Algorithm) post-quantum 
 license = "MIT"
 keywords = ["cryptography", "post-quantum", "signature", "ml-dsa", "dilithium"]
 categories = ["cryptography"]
+repository = "https://github.com/kearneyjj1/pq-cryto"
 
 [dependencies]
 rand = "0.8"
@@ -16,6 +17,3 @@ zeroize = { version = "1.7", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 hex = "0.4"
 
-# [[bench]]
-# name = "ml_dsa_bench"
-# harness = false
