@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "FN-DSA (FALCON) lattice-based post-quantum signature scheme"
 license = "MIT"
-repository = "https://github.com/jkearney/pq-cryto"
+repository = "https://github.com/kearneyjj1/pq-cryto"
+keywords = ["cryptography", "post-quantum", "signature", "falcon", "fn-dsa"]
+categories = ["cryptography"]
 
 [dependencies]
 rand = "0.8"
