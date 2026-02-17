@@ -7,45 +7,60 @@ use sha3::{Shake256, digest::{ExtendableOutput, Update, XofReader}};
 use crate::field::Zq;
 use crate::params::{Params, Q, NONCE_SIZE};
 
-/// Hashes a message and nonce to a polynomial in Z_q.
+/// Hashes a message and nonce to a polynomial in Z_q (constant-time).
 ///
 /// Uses SHAKE256 to generate a uniformly random polynomial c ∈ Z_q[X]/(X^n + 1).
 /// The output polynomial has coefficients in [0, q-1].
 ///
-/// Matches the Falcon reference implementation (`hash_to_point_ct`):
+/// Implements constant-time rejection sampling matching the Falcon reference
+/// `hash_to_point_ct` to prevent timing side-channel leakage:
 /// - Input: SHAKE256(nonce || message)
 /// - Reads 2 bytes big-endian as a 16-bit value w
 /// - Accepts if w < 5*q = 61445, rejects otherwise
 /// - Reduces w mod q to get the coefficient
+/// - All samples are processed identically regardless of acceptance
 pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     let n = params.n;
     let mut result = vec![Zq::ZERO; n];
 
-    // Create SHAKE256 instance
     let mut hasher = Shake256::default();
     hasher.update(nonce);
     hasher.update(message);
-
     let mut reader = hasher.finalize_xof();
 
-    // Generate n coefficients using rejection sampling
-    // (matching Falcon reference: big-endian, accept < 5*q, reduce mod q)
-    let mut buf = [0u8; 2];
-    let mut i = 0;
+    // Oversample: read enough 2-byte pairs to guarantee >= n accepted values.
+    // Acceptance rate is 61445/65536 ≈ 93.8%. For n=512, 840 samples gives
+    // a negligible probability of insufficient accepted values.
+    let num_samples = n + n / 4 + 200;
+    let mut buf = vec![0u8; num_samples * 2];
+    reader.read(&mut buf);
 
-    while i < n {
-        reader.read(&mut buf);
-
-        // Big-endian interpretation (matching Falcon reference implementation)
-        let w = ((buf[0] as u32) << 8) | (buf[1] as u32);
-
-        // Accept if w < 5*q = 61445, reject otherwise
-        if w < 61445 {
-            let val = (w % (Q as u32)) as i16;
-            result[i] = Zq::from_i16_unchecked(val);
-            i += 1;
-        }
+    // Pass 1: evaluate all samples, store value + validity
+    let mut samples = Vec::with_capacity(num_samples);
+    for k in 0..num_samples {
+        let w = ((buf[2 * k] as u32) << 8) | (buf[2 * k + 1] as u32);
+        let valid = w < 61445;
+        let val = (w % (Q as u32)) as i16;
+        samples.push((val, valid));
     }
+
+    // Pass 2: constant-time fill — process every sample, no branching on validity
+    let mut i: usize = 0;
+    for &(val, valid) in &samples {
+        // Constant-time: only write if valid AND we still need values
+        let need = i < n;
+        let accept = valid & need;
+
+        // Branchless conditional write using a mask
+        let mask = -(accept as i16); // -1 (0xFFFF) if accept, 0 if not
+        let idx = if i < n { i } else { n - 1 };
+        let old = result[idx].value();
+        result[idx] = Zq::from_i16_unchecked((old & !mask) | (val & mask));
+
+        i += accept as usize;
+    }
+
+    assert!(i >= n, "hash_to_point: insufficient accepted samples");
 
     result
 }
