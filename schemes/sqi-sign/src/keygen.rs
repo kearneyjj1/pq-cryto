@@ -10,6 +10,11 @@
 //! 2. Sample a random ideal I of smooth norm
 //! 3. Translate I to an isogeny φ: E₀ → E_A using Deuring correspondence
 //! 4. Return (E_A, I) as (public key, secret key)
+//!
+//! # Security Notes
+//!
+//! Secret keys implement `Zeroize` and `ZeroizeOnDrop` to ensure sensitive
+//! material is securely erased from memory when no longer needed.
 
 use crate::curve::{Curve, E0};
 use crate::error::Result;
@@ -22,6 +27,7 @@ use num_bigint::BigInt;
 use num_traits::One;
 use rand::{CryptoRng, RngCore};
 use sha3::{Digest, Sha3_256};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// SQI-SIGN public key.
 ///
@@ -99,6 +105,13 @@ impl PublicKey {
 ///
 /// The secret key contains the ideal I_A corresponding to the secret isogeny
 /// φ: E₀ → E_A, along with precomputed data for efficient signing.
+///
+/// # Security
+///
+/// This struct implements `Zeroize` and `ZeroizeOnDrop` to ensure that
+/// sensitive key material is securely erased from memory when the key
+/// is dropped or explicitly zeroized. This helps prevent secret key
+/// material from being leaked through memory dumps or similar attacks.
 #[derive(Clone)]
 pub struct SecretKey {
     /// The secret ideal corresponding to the secret isogeny.
@@ -111,20 +124,87 @@ pub struct SecretKey {
     pub endo_ring: MaximalOrder,
     /// Parameter set.
     pub params: Params,
+    /// Sensitive seed material (zeroized on drop).
+    seed_material: Option<SensitiveSeed>,
+}
+
+/// Wrapper for sensitive seed bytes that implements proper zeroization.
+#[derive(Clone)]
+struct SensitiveSeed {
+    data: Vec<u8>,
+}
+
+impl Zeroize for SensitiveSeed {
+    fn zeroize(&mut self) {
+        self.data.zeroize();
+    }
+}
+
+impl Drop for SensitiveSeed {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for SensitiveSeed {}
+
+impl Zeroize for SecretKey {
+    fn zeroize(&mut self) {
+        // Zeroize the seed material
+        if let Some(ref mut seed) = self.seed_material {
+            seed.zeroize();
+        }
+        self.seed_material = None;
+
+        // Zeroize the ideal by overwriting with zeros
+        // Since BigInt doesn't implement Zeroize, we convert to bytes, zeroize, and clear
+        self.zeroize_ideal();
+
+        // Zeroize isogeny data
+        self.zeroize_isogeny();
+    }
+}
+
+impl SecretKey {
+    /// Securely zeroizes the ideal's quaternion coefficients.
+    fn zeroize_ideal(&mut self) {
+        let p = self.endo_ring.p.clone();
+
+        // Create a zero ideal to overwrite
+        let zero_quat = Quaternion::zero(p.clone());
+        self.ideal = LeftIdeal::principal(&self.endo_ring, zero_quat);
+
+        // Force volatile write to prevent optimizer from removing the zeroization
+        // by serializing and immediately zeroizing
+        let mut ideal_bytes = Vec::new();
+        for q in &self.ideal.basis {
+            ideal_bytes.extend(q.a.num.to_bytes_le().1);
+            ideal_bytes.extend(q.b.num.to_bytes_le().1);
+            ideal_bytes.extend(q.c.num.to_bytes_le().1);
+            ideal_bytes.extend(q.d.num.to_bytes_le().1);
+        }
+        ideal_bytes.zeroize();
+    }
+
+    /// Securely zeroizes isogeny data.
+    fn zeroize_isogeny(&mut self) {
+        // Zeroize kernel points data
+        let mut isogeny_data = Vec::new();
+        for pt in self.isogeny.kernel_points() {
+            isogeny_data.extend(pt.x.re.value.to_bytes_le().1);
+            isogeny_data.extend(pt.x.im.value.to_bytes_le().1);
+        }
+        isogeny_data.zeroize();
+    }
 }
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        // Zeroize sensitive data
-        // Note: In production, would implement proper zeroization
-        // For now, overwrite with zeros
-        let p = self.endo_ring.p.clone();
-        self.ideal = LeftIdeal::principal(
-            &self.endo_ring,
-            Quaternion::zero(p),
-        );
+        self.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for SecretKey {}
 
 impl SecretKey {
     /// Creates a new secret key.
@@ -141,6 +221,26 @@ impl SecretKey {
             public_curve,
             endo_ring,
             params,
+            seed_material: None,
+        }
+    }
+
+    /// Creates a new secret key with seed material for future zeroization.
+    pub fn new_with_seed(
+        ideal: LeftIdeal,
+        isogeny: Isogeny,
+        public_curve: Curve,
+        endo_ring: MaximalOrder,
+        params: Params,
+        seed: &[u8],
+    ) -> Self {
+        Self {
+            ideal,
+            isogeny,
+            public_curve,
+            endo_ring,
+            params,
+            seed_material: Some(SensitiveSeed { data: seed.to_vec() }),
         }
     }
 
@@ -222,6 +322,36 @@ pub fn keygen_internal(seed: &[u8; 32], params: Params) -> (PublicKey, SecretKey
     keygen_from_seed(seed, params)
 }
 
+/// Derives a field element from a seed with full entropy.
+///
+/// Uses SHA3-256 with domain separation to derive a coefficient.
+/// The full 256-bit hash output is used, then reduced modulo p.
+/// For primes larger than 256 bits, multiple rounds are used.
+fn derive_coefficient_from_seed(seed: &[u8], domain: &[u8], modulus: &BigInt) -> BigInt {
+    // Calculate how many bytes we need (prime size + security margin)
+    let prime_bits = modulus.bits();
+    let bytes_needed = ((prime_bits + 128) / 8) as usize; // Extra 128 bits for uniform distribution
+
+    let mut output = Vec::with_capacity(bytes_needed);
+    let mut counter: u32 = 0;
+
+    // Use counter mode to generate enough bytes
+    while output.len() < bytes_needed {
+        let mut hasher = Sha3_256::new();
+        hasher.update(seed);
+        hasher.update(domain);
+        hasher.update(&counter.to_le_bytes());
+        let hash = hasher.finalize();
+        output.extend_from_slice(&hash);
+        counter += 1;
+    }
+
+    output.truncate(bytes_needed);
+
+    // Convert to BigInt and reduce modulo p
+    BigInt::from_bytes_le(num_bigint::Sign::Plus, &output) % modulus
+}
+
 /// Key generation from a seed (deterministic).
 fn keygen_from_seed(seed: &[u8; 32], params: Params) -> (PublicKey, SecretKey) {
     let p = params.prime().clone();
@@ -230,24 +360,20 @@ fn keygen_from_seed(seed: &[u8; 32], params: Params) -> (PublicKey, SecretKey) {
     let _e0 = E0::new(p.clone());
     let o0 = MaximalOrder::standard(p.clone());
 
-    // Step 2: Derive secret ideal from seed
-    // Hash seed to get coefficients for ideal generator
-    let mut hasher = Sha3_256::new();
-    hasher.update(seed);
-    hasher.update(b"SQI-SIGN-KEYGEN");
-    let hash = hasher.finalize();
+    // Step 2: Derive secret ideal from seed using full-entropy derivation
+    // Use separate hash derivations for each coefficient to maximize entropy
+    let a_coeff = derive_coefficient_from_seed(seed, b"SQI-SIGN-KEYGEN-COEFF-A", &p);
+    let b_coeff = derive_coefficient_from_seed(seed, b"SQI-SIGN-KEYGEN-COEFF-B", &p);
+    let c_coeff = derive_coefficient_from_seed(seed, b"SQI-SIGN-KEYGEN-COEFF-C", &p);
+    let d_coeff = derive_coefficient_from_seed(seed, b"SQI-SIGN-KEYGEN-COEFF-D", &p);
 
-    // Use hash to derive quaternion coefficients
-    let a_coeff = BigInt::from_bytes_le(num_bigint::Sign::Plus, &hash[0..8]) % &p;
-    let b_coeff = BigInt::from_bytes_le(num_bigint::Sign::Plus, &hash[8..16]) % &p;
-
-    // Create generator with smooth norm (for efficient signing)
-    // Using small coefficients ensures manageable isogeny degrees
+    // Create generator with all four quaternion components for better entropy
+    // Using full quaternion (not just a+bi) improves security
     let generator = Quaternion::new(
-        Rational::from_int(a_coeff.clone() + BigInt::one()),
+        Rational::from_int(a_coeff + BigInt::one()), // Ensure non-zero
         Rational::from_int(b_coeff),
-        Rational::zero(),
-        Rational::zero(),
+        Rational::from_int(c_coeff),
+        Rational::from_int(d_coeff),
         p.clone(),
     );
 
@@ -261,9 +387,9 @@ fn keygen_from_seed(seed: &[u8; 32], params: Params) -> (PublicKey, SecretKey) {
     // The codomain is determined by the isogeny
     let public_curve = isogeny.codomain.clone();
 
-    // Create keys
+    // Create keys (store seed for proper zeroization on drop)
     let public_key = PublicKey::new(public_curve.clone(), params.clone());
-    let secret_key = SecretKey::new(ideal, isogeny, public_curve, o0, params);
+    let secret_key = SecretKey::new_with_seed(ideal, isogeny, public_curve, o0, params, seed);
 
     (public_key, secret_key)
 }

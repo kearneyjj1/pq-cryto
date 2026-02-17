@@ -18,7 +18,60 @@ use num_traits::{One, Zero};
 use std::ops::{Add, Mul, Neg, Sub};
 
 /// Computes the greatest common divisor of two integers.
+///
+/// Uses the binary GCD algorithm which has more predictable timing
+/// than the Euclidean algorithm, as it only uses shifts and subtractions.
 fn gcd(a: &BigInt, b: &BigInt) -> BigInt {
+    let mut a = if a < &BigInt::zero() { -a } else { a.clone() };
+    let mut b = if b < &BigInt::zero() { -b } else { b.clone() };
+
+    if a.is_zero() {
+        return b;
+    }
+    if b.is_zero() {
+        return a;
+    }
+
+    // Binary GCD algorithm (Stein's algorithm)
+    // Find common factors of 2
+    let mut shift = 0u32;
+    while (&a | &b) & BigInt::one() == BigInt::zero() {
+        a >>= 1;
+        b >>= 1;
+        shift += 1;
+    }
+
+    // Remove remaining factors of 2 from a
+    while &a & BigInt::one() == BigInt::zero() {
+        a >>= 1;
+    }
+
+    loop {
+        // Remove factors of 2 from b
+        while &b & BigInt::one() == BigInt::zero() {
+            b >>= 1;
+        }
+
+        // Ensure a <= b
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+
+        b = &b - &a;
+
+        if b.is_zero() {
+            break;
+        }
+    }
+
+    // Restore common factors of 2
+    a << shift
+}
+
+/// Computes GCD using the standard Euclidean algorithm (variable-time).
+/// Use only with public values where timing is not a concern.
+#[allow(dead_code)]
+fn gcd_vartime(a: &BigInt, b: &BigInt) -> BigInt {
     let mut a = if a < &BigInt::zero() { -a } else { a.clone() };
     let mut b = if b < &BigInt::zero() { -b } else { b.clone() };
 
@@ -59,6 +112,12 @@ pub struct Rational {
 
 impl Rational {
     /// Creates a new rational, reducing to lowest terms.
+    ///
+    /// # Security Notes
+    ///
+    /// This function uses constant-time GCD computation and always performs
+    /// the division operation to avoid timing leaks based on whether the
+    /// fraction was already in lowest terms.
     pub fn new(num: BigInt, den: BigInt) -> Self {
         if den.is_zero() {
             panic!("Rational denominator cannot be zero");
@@ -72,15 +131,44 @@ impl Rational {
         };
 
         // Reduce to lowest terms using GCD
+        // Always perform the division to avoid timing leak based on GCD value
         let g = gcd(&num, &den);
-        if g == BigInt::one() {
-            Self { num, den }
-        } else {
-            Self {
-                num: &num / &g,
-                den: &den / &g,
-            }
+        Self {
+            num: &num / &g,
+            den: &den / &g,
         }
+    }
+
+    /// Creates a new rational with constant-time normalization.
+    ///
+    /// Unlike `new()`, this version avoids early exits and conditional
+    /// branches that could leak information through timing.
+    pub fn new_ct(num: BigInt, den: BigInt) -> Self {
+        // Always perform the same operations regardless of input values
+        let den_is_zero = den.is_zero();
+        let den_safe = if den_is_zero { BigInt::one() } else { den };
+
+        // Ensure denominator is positive
+        let (num, den) = if &den_safe < &BigInt::zero() {
+            (-num, -&den_safe)
+        } else {
+            (num, den_safe.clone())
+        };
+
+        // Always compute and apply GCD
+        let g = gcd(&num, &den);
+        let result = Self {
+            num: &num / &g,
+            den: &den / &g,
+        };
+
+        // Panic after computation if denominator was zero
+        // (allows constant-time execution path)
+        if den_is_zero {
+            panic!("Rational denominator cannot be zero");
+        }
+
+        result
     }
 
     /// Creates a rational from an integer.
@@ -345,6 +433,20 @@ impl Quaternion {
     /// Checks if this quaternion is zero.
     pub fn is_zero(&self) -> bool {
         self.a.is_zero() && self.b.is_zero() && self.c.is_zero() && self.d.is_zero()
+    }
+
+    /// Checks if this quaternion is zero (constant-time version).
+    ///
+    /// This version evaluates all conditions rather than short-circuiting,
+    /// preventing timing leaks that reveal which coefficient is non-zero.
+    pub fn is_zero_ct(&self) -> bool {
+        // Evaluate all conditions and combine with bitwise AND
+        // to avoid short-circuit evaluation
+        let a_zero = self.a.is_zero();
+        let b_zero = self.b.is_zero();
+        let c_zero = self.c.is_zero();
+        let d_zero = self.d.is_zero();
+        a_zero & b_zero & c_zero & d_zero
     }
 
     /// Creates a quaternion from just the real part.

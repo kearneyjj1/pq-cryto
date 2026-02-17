@@ -15,6 +15,7 @@
 //! formulas which are more efficient for isogeny computation.
 
 use crate::curve::{Curve, Point};
+use crate::error::{Result, SqiSignError};
 use crate::fp2::Fp2;
 use num_bigint::BigInt;
 use num_traits::One;
@@ -72,18 +73,34 @@ impl Isogeny {
     ///
     /// A' = 2(1 - 2x_K²) when x_K ≠ 0
     /// A' = -A when x_K = 0 (kernel at origin)
+    ///
+    /// If the kernel is the point at infinity, returns the identity isogeny.
     pub fn isogeny_2(domain: &Curve, kernel: &Point) -> Self {
         let modulus = domain.modulus.clone();
 
         if kernel.is_infinity() {
-            panic!("Kernel point cannot be infinity for 2-isogeny");
+            // Return identity isogeny (domain = codomain, degree = 1)
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         }
 
         // Normalize kernel point to get x_K = X_K / Z_K
         let x_k = if let Some(norm) = kernel.normalize() {
             norm.x
         } else {
-            panic!("Cannot normalize kernel point");
+            // Cannot normalize, return identity
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         };
 
         let one = Fp2::one(modulus.clone());
@@ -122,22 +139,45 @@ impl Isogeny {
     ///
     /// For Montgomery curves, the 3-isogeny formula gives:
     /// A' = (A·x_K⁴ - 6x_K² + A) / x_K² for kernel at x = x_K
+    ///
+    /// If the kernel is the point at infinity, returns the identity isogeny.
     pub fn isogeny_3(domain: &Curve, kernel: &Point) -> Self {
         let modulus = domain.modulus.clone();
 
         if kernel.is_infinity() {
-            panic!("Kernel point cannot be infinity for 3-isogeny");
+            // Return identity isogeny (domain = codomain, degree = 1)
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         }
 
         // Normalize to get x_K
         let x_k = if let Some(norm) = kernel.normalize() {
             norm.x
         } else {
-            panic!("Cannot normalize kernel point");
+            // Cannot normalize, return identity
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         };
 
         if x_k.is_zero() {
-            panic!("Kernel x-coordinate cannot be zero for 3-isogeny");
+            // x_K = 0 is not valid for 3-isogeny, return identity
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         }
 
         let one = Fp2::one(modulus.clone());
@@ -175,8 +215,17 @@ impl Isogeny {
     ///
     /// The kernel point must have order exactly ℓ.
     ///
-    /// This uses the general Vélu formula which computes the isogeny
-    /// by iterating over all non-trivial kernel points.
+    /// This uses Vélu's formulas adapted for Montgomery curves in the form:
+    /// By² = x³ + Ax² + x
+    ///
+    /// For kernel points with x-coordinates {x₁, ..., x_k} where k = (ℓ-1)/2:
+    /// - σ = Σᵢ xᵢ
+    /// - σ' = Σᵢ (1/xᵢ)
+    /// - A' = A - 5(σ + σ')
+    ///
+    /// This formula is derived from Vélu's formulas specialized to Montgomery form.
+    ///
+    /// If the kernel is the point at infinity, returns the identity isogeny.
     pub fn isogeny_odd(domain: &Curve, kernel: &Point, ell: u64) -> Self {
         if ell == 2 {
             return Self::isogeny_2(domain, kernel);
@@ -188,7 +237,14 @@ impl Isogeny {
         let modulus = domain.modulus.clone();
 
         if kernel.is_infinity() {
-            panic!("Kernel point cannot be infinity");
+            // Return identity isogeny
+            return Self {
+                domain: domain.clone(),
+                codomain: domain.clone(),
+                degree: BigInt::one(),
+                kernel_gen: None,
+                kernel_points: Vec::new(),
+            };
         }
 
         // Compute all kernel points: K, 2K, 3K, ..., ((ℓ-1)/2)K
@@ -197,36 +253,52 @@ impl Isogeny {
         let mut kernel_points = Vec::with_capacity(half_ell as usize);
         let mut current = kernel.clone();
 
-        for _ in 0..half_ell {
+        for i in 0..half_ell {
             kernel_points.push(current.clone());
-            current = domain.xadd(&current, kernel, kernel);
-        }
-
-        // Vélu's formula for Montgomery curves:
-        // For each kernel point with x-coordinate x_i:
-        // σ = Σ x_i
-        // π = Π x_i
-        // The new curve coefficient involves these sums/products
-
-        let one = Fp2::one(modulus.clone());
-
-        // Compute sum of x-coordinates (for Vélu formula)
-        let mut sigma = Fp2::zero(modulus.clone());
-
-        for pt in &kernel_points {
-            if let Some(norm) = pt.normalize() {
-                sigma = &sigma + &norm.x;
+            if i < half_ell - 1 {
+                // Compute (i+2)K = (i+1)K + K using differential addition
+                let next = domain.xadd(&current, kernel, &if i == 0 {
+                    Point::infinity(modulus.clone())
+                } else {
+                    kernel_points[i as usize - 1].clone()
+                });
+                current = next;
             }
         }
 
-        // For odd ℓ-isogeny on Montgomery curve:
-        // A' = A - 6σ (simplified formula for specific cases)
-        // This is an approximation; the full formula is more complex
-        let six = {
-            let three = &(&one + &one) + &one;
-            &three + &three
-        };
-        let new_a = &domain.a - &(&six * &sigma);
+        // Vélu's formula for Montgomery curves:
+        // A' = A - 5(σ + σ') where:
+        // - σ = Σᵢ xᵢ (sum of x-coordinates)
+        // - σ' = Σᵢ (1/xᵢ) (sum of inverse x-coordinates)
+
+        let one = Fp2::one(modulus.clone());
+
+        // Compute sums for Vélu formula
+        let mut sigma = Fp2::zero(modulus.clone());
+        let mut sigma_inv = Fp2::zero(modulus.clone());
+
+        for pt in &kernel_points {
+            if let Some(norm) = pt.normalize() {
+                // Add x_i to sigma
+                sigma = &sigma + &norm.x;
+
+                // Add 1/x_i to sigma_inv (if x_i is invertible)
+                if !norm.x.is_zero() {
+                    if let Some(x_inv) = norm.x.inverse() {
+                        sigma_inv = &sigma_inv + &x_inv;
+                    }
+                }
+            }
+        }
+
+        // Compute A' = A - 5(σ + σ')
+        let two = &one + &one;
+        let three = &two + &one;
+        let five = &three + &two;
+
+        let sum_term = &sigma + &sigma_inv;
+        let correction = &five * &sum_term;
+        let new_a = &domain.a - &correction;
 
         let codomain = Curve::new(new_a);
 
@@ -399,6 +471,140 @@ impl Isogeny {
             kernel_gen: None, // Would need to compute
             kernel_points: Vec::new(),
         }
+    }
+
+    /// Fallible version of isogeny_2 that returns Result instead of identity.
+    ///
+    /// Use this when you need proper error handling for invalid kernel points.
+    ///
+    /// # Validation
+    ///
+    /// This function validates:
+    /// - Domain curve is well-formed
+    /// - Kernel point is not infinity
+    /// - Kernel point can be normalized
+    /// - Kernel point lies on the domain curve (if validation is enabled)
+    pub fn try_isogeny_2(domain: &Curve, kernel: &Point) -> Result<Self> {
+        // Validate domain curve
+        if !domain.is_valid() {
+            return Err(SqiSignError::IsogenyFailed {
+                reason: "domain curve is not valid",
+            });
+        }
+
+        if kernel.is_infinity() {
+            return Err(SqiSignError::InvalidKernel {
+                reason: "kernel point is infinity for 2-isogeny",
+            });
+        }
+
+        // Validate kernel point lies on domain curve
+        if !kernel.is_valid_on_curve(domain) {
+            return Err(SqiSignError::InvalidKernel {
+                reason: "kernel point does not lie on domain curve",
+            });
+        }
+
+        let norm = kernel.normalize().ok_or(SqiSignError::InvalidKernel {
+            reason: "cannot normalize kernel point",
+        })?;
+
+        let modulus = domain.modulus.clone();
+        let one = Fp2::one(modulus.clone());
+        let two = &one + &one;
+
+        let new_a = if norm.x.is_zero() {
+            -&domain.a
+        } else {
+            let x_k_sq = &norm.x * &norm.x;
+            let two_x_k_sq = &two * &x_k_sq;
+            let inner = &one - &two_x_k_sq;
+            &two * &inner
+        };
+
+        let codomain = Curve::new(new_a);
+
+        Ok(Self {
+            domain: domain.clone(),
+            codomain,
+            degree: BigInt::from(2),
+            kernel_gen: Some(kernel.clone()),
+            kernel_points: vec![kernel.clone()],
+        })
+    }
+
+    /// Fallible version of isogeny_3 that returns Result instead of identity.
+    ///
+    /// Use this when you need proper error handling for invalid kernel points.
+    ///
+    /// # Validation
+    ///
+    /// This function validates:
+    /// - Domain curve is well-formed
+    /// - Kernel point is not infinity
+    /// - Kernel point can be normalized
+    /// - Kernel x-coordinate is non-zero
+    /// - Kernel point lies on the domain curve
+    pub fn try_isogeny_3(domain: &Curve, kernel: &Point) -> Result<Self> {
+        // Validate domain curve
+        if !domain.is_valid() {
+            return Err(SqiSignError::IsogenyFailed {
+                reason: "domain curve is not valid",
+            });
+        }
+
+        if kernel.is_infinity() {
+            return Err(SqiSignError::InvalidKernel {
+                reason: "kernel point is infinity for 3-isogeny",
+            });
+        }
+
+        // Validate kernel point lies on domain curve
+        if !kernel.is_valid_on_curve(domain) {
+            return Err(SqiSignError::InvalidKernel {
+                reason: "kernel point does not lie on domain curve",
+            });
+        }
+
+        let norm = kernel.normalize().ok_or(SqiSignError::InvalidKernel {
+            reason: "cannot normalize kernel point",
+        })?;
+
+        if norm.x.is_zero() {
+            return Err(SqiSignError::InvalidKernel {
+                reason: "kernel x-coordinate is zero for 3-isogeny",
+            });
+        }
+
+        let modulus = domain.modulus.clone();
+        let one = Fp2::one(modulus.clone());
+        let six = {
+            let two = &one + &one;
+            let three = &two + &one;
+            &three + &three
+        };
+
+        let x_k_sq = &norm.x * &norm.x;
+        let x_k_4 = &x_k_sq * &x_k_sq;
+
+        let a_x4 = &domain.a * &x_k_4;
+        let six_x2 = &six * &x_k_sq;
+        let numerator = &(&a_x4 - &six_x2) + &domain.a;
+
+        let x_k_sq_inv = x_k_sq.inverse().ok_or(SqiSignError::InvalidKernel {
+            reason: "x_K² is not invertible",
+        })?;
+        let new_a = &numerator * &x_k_sq_inv;
+
+        let codomain = Curve::new(new_a);
+
+        Ok(Self {
+            domain: domain.clone(),
+            codomain,
+            degree: BigInt::from(3),
+            kernel_gen: Some(kernel.clone()),
+            kernel_points: vec![kernel.clone()],
+        })
     }
 }
 

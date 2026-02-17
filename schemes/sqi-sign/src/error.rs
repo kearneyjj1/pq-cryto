@@ -44,6 +44,16 @@ pub enum SqiSignError {
     InvalidPublicKey,
     /// Invalid secret key.
     InvalidSecretKey,
+    /// Invalid kernel point for isogeny computation.
+    InvalidKernel {
+        /// Reason for failure.
+        reason: &'static str,
+    },
+    /// Field element operation failed.
+    FieldError {
+        /// Reason for failure.
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for SqiSignError {
@@ -62,6 +72,8 @@ impl fmt::Display for SqiSignError {
             Self::IdealError { reason } => write!(f, "Ideal computation error: {}", reason),
             Self::InvalidPublicKey => write!(f, "Invalid public key"),
             Self::InvalidSecretKey => write!(f, "Invalid secret key"),
+            Self::InvalidKernel { reason } => write!(f, "Invalid kernel point: {}", reason),
+            Self::FieldError { reason } => write!(f, "Field element error: {}", reason),
         }
     }
 }

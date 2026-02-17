@@ -22,12 +22,60 @@ use crate::keygen::SecretKey;
 use crate::params::Params;
 use crate::quaternion::{MaximalOrder, Quaternion, Rational};
 use num_bigint::BigInt;
-use num_traits::One;
+use num_traits::{One, Zero};
 use rand::{CryptoRng, RngCore};
 use sha3::{Digest, Sha3_256};
 
 /// Maximum signing attempts before giving up.
 const MAX_ATTEMPTS: u32 = 100;
+
+/// Converts a BigInt to a fixed-size byte array in little-endian format.
+///
+/// If the value requires fewer bytes, the array is zero-padded.
+/// If the value requires more bytes, it is truncated (caller must ensure this doesn't happen).
+fn bigint_to_fixed_bytes(value: &BigInt, size: usize) -> Vec<u8> {
+    let (_, mut bytes) = value.to_bytes_le();
+
+    // Pad with zeros if needed
+    if bytes.len() < size {
+        bytes.resize(size, 0);
+    }
+
+    // Truncate if too long (shouldn't happen if size is chosen correctly)
+    bytes.truncate(size);
+
+    bytes
+}
+
+/// Derives a field element from a seed with full entropy.
+///
+/// Uses SHA3-256 with domain separation to derive a coefficient.
+/// The full 256-bit hash output is used, then reduced modulo p.
+/// For primes larger than 256 bits, multiple rounds are used.
+fn derive_commitment_coefficient(seed: &[u8], domain: &[u8], modulus: &BigInt) -> BigInt {
+    // Calculate how many bytes we need (prime size + security margin)
+    let prime_bits = modulus.bits();
+    let bytes_needed = ((prime_bits + 128) / 8) as usize; // Extra 128 bits for uniform distribution
+
+    let mut output = Vec::with_capacity(bytes_needed);
+    let mut counter: u32 = 0;
+
+    // Use counter mode to generate enough bytes
+    while output.len() < bytes_needed {
+        let mut hasher = Sha3_256::new();
+        hasher.update(seed);
+        hasher.update(domain);
+        hasher.update(&counter.to_le_bytes());
+        let hash = hasher.finalize();
+        output.extend_from_slice(&hash);
+        counter += 1;
+    }
+
+    output.truncate(bytes_needed);
+
+    // Convert to BigInt and reduce modulo p
+    BigInt::from_bytes_le(num_bigint::Sign::Plus, &output) % modulus
+}
 
 /// A SQI-SIGN signature.
 #[derive(Clone, Debug)]
@@ -50,8 +98,51 @@ pub struct CompressedIsogeny {
 }
 
 impl Signature {
-    /// Serializes the signature to bytes.
+    /// Serializes the signature to bytes using canonical encoding.
+    ///
+    /// # Encoding Format
+    ///
+    /// The signature uses fixed-size encoding to ensure canonical representation:
+    /// - Commitment A coefficient (real part): `field_bytes` bytes, little-endian
+    /// - Commitment A coefficient (imag part): `field_bytes` bytes, little-endian
+    /// - Response degree: 8 bytes, little-endian
+    /// - Response data length: 4 bytes, little-endian
+    /// - Response data: variable length
+    ///
+    /// All field elements are reduced to canonical form [0, p-1] before encoding.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let modulus = &self.commitment.modulus;
+        let field_bytes = (modulus.bits() as usize + 7) / 8;
+
+        let mut bytes = Vec::new();
+
+        // Serialize commitment curve A coefficient with fixed-size encoding
+        // Ensure canonical form (value in [0, p-1])
+        let re_canonical = &self.commitment.a.re.value % modulus;
+        let im_canonical = &self.commitment.a.im.value % modulus;
+
+        // Convert to fixed-size byte arrays
+        let re_bytes = bigint_to_fixed_bytes(&re_canonical, field_bytes);
+        let im_bytes = bigint_to_fixed_bytes(&im_canonical, field_bytes);
+
+        bytes.extend(&re_bytes);
+        bytes.extend(&im_bytes);
+
+        // Serialize response degree (fixed 8 bytes for up to 64-bit degrees)
+        let degree_bytes = bigint_to_fixed_bytes(&self.response.degree, 8);
+        bytes.extend(&degree_bytes);
+
+        // Serialize response data with length prefix
+        bytes.extend(&(self.response.data.len() as u32).to_le_bytes());
+        bytes.extend(&self.response.data);
+
+        bytes
+    }
+
+    /// Serializes the signature using the legacy variable-length format.
+    /// Provided for backwards compatibility only.
+    #[deprecated(note = "Use to_bytes() for canonical encoding")]
+    pub fn to_bytes_legacy(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
         // Serialize commitment curve (A coefficient)
@@ -77,35 +168,37 @@ impl Signature {
         bytes
     }
 
-    /// Deserializes a signature from bytes.
+    /// Deserializes a signature from canonical encoding.
+    ///
+    /// Validates that field elements are in canonical form [0, p-1].
+    /// Rejects signatures with non-canonical representations to prevent malleability.
     pub fn from_bytes(bytes: &[u8], modulus: &BigInt) -> Result<Self> {
+        let field_bytes = (modulus.bits() as usize + 7) / 8;
         let mut offset = 0;
 
-        // Read re
-        if bytes.len() < offset + 4 {
+        // Read re (fixed-size)
+        if bytes.len() < offset + field_bytes {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let re_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
+        let re = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + field_bytes]);
+        offset += field_bytes;
 
-        if bytes.len() < offset + re_len {
+        // Validate canonical form: re must be < modulus
+        if &re >= modulus {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let re = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + re_len]);
-        offset += re_len;
 
-        // Read im
-        if bytes.len() < offset + 4 {
+        // Read im (fixed-size)
+        if bytes.len() < offset + field_bytes {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let im_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
+        let im = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + field_bytes]);
+        offset += field_bytes;
 
-        if bytes.len() < offset + im_len {
+        // Validate canonical form: im must be < modulus
+        if &im >= modulus {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let im = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + im_len]);
-        offset += im_len;
 
         // Construct commitment curve
         let a = Fp2::new(
@@ -114,25 +207,29 @@ impl Signature {
         );
         let commitment = Curve::new(a);
 
-        // Read degree
-        if bytes.len() < offset + 4 {
+        // Read degree (fixed 8 bytes)
+        if bytes.len() < offset + 8 {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let deg_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
+        let degree = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + 8]);
+        offset += 8;
 
-        if bytes.len() < offset + deg_len {
+        // Validate degree is positive
+        if degree <= BigInt::zero() {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
-        let degree = BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes[offset..offset + deg_len]);
-        offset += deg_len;
 
-        // Read data
+        // Read data length (4 bytes)
         if bytes.len() < offset + 4 {
             return Err(crate::error::SqiSignError::InvalidSignature);
         }
         let data_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
+
+        // Validate data_len is reasonable (prevent DoS via large allocations)
+        if data_len > 1024 * 1024 {
+            return Err(crate::error::SqiSignError::InvalidSignature);
+        }
 
         if bytes.len() < offset + data_len {
             return Err(crate::error::SqiSignError::InvalidSignature);
@@ -210,25 +307,22 @@ fn sample_commitment<R: RngCore + CryptoRng>(
     let p = params.prime().clone();
     let o0 = MaximalOrder::standard(p.clone());
 
-    // Generate random coefficients for commitment ideal generator
+    // Generate random seed with full entropy
     let mut seed = [0u8; 32];
     rng.fill_bytes(&mut seed);
 
-    let mut hasher = Sha3_256::new();
-    hasher.update(&seed);
-    hasher.update(b"SQI-SIGN-COMMITMENT");
-    let hash = hasher.finalize();
+    // Derive coefficients with full entropy using separate domain separators
+    let a = derive_commitment_coefficient(&seed, b"SQI-SIGN-COMMIT-A", &p) + BigInt::one();
+    let b = derive_commitment_coefficient(&seed, b"SQI-SIGN-COMMIT-B", &p);
+    let c = derive_commitment_coefficient(&seed, b"SQI-SIGN-COMMIT-C", &p);
+    let d = derive_commitment_coefficient(&seed, b"SQI-SIGN-COMMIT-D", &p);
 
-    // Derive coefficients from hash
-    let a = BigInt::from_bytes_le(num_bigint::Sign::Plus, &hash[0..8]) % &p + BigInt::one();
-    let b = BigInt::from_bytes_le(num_bigint::Sign::Plus, &hash[8..16]) % &p;
-
-    // Create generator quaternion with smooth norm
+    // Create generator quaternion with all four components for better security
     let generator = Quaternion::new(
         Rational::from_int(a),
         Rational::from_int(b),
-        Rational::zero(),
-        Rational::zero(),
+        Rational::from_int(c),
+        Rational::from_int(d),
         p.clone(),
     );
 
