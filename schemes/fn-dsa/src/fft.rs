@@ -325,15 +325,47 @@ fn get_roots(n: usize) -> &'static [Complex] {
 }
 
 // ============================================================================
-// FFT Operations (Falcon recursive form)
+// Bit-reversal helpers
+// ============================================================================
+
+/// Reverses the lower `bits` bits of `x`.
+#[inline]
+fn reverse_bits(x: usize, bits: u32) -> usize {
+    let mut result = 0usize;
+    let mut v = x;
+    for _ in 0..bits {
+        result = (result << 1) | (v & 1);
+        v >>= 1;
+    }
+    result
+}
+
+/// In-place bit-reversal permutation.
+///
+/// The recursive Falcon FFT de-interleaves (even/odd split) at each level,
+/// which is equivalent to a bit-reversal permutation of the indices.
+fn bit_reverse_permute(a: &mut [Complex]) {
+    let n = a.len();
+    let log_n = n.trailing_zeros();
+    for i in 0..n {
+        let j = reverse_bits(i, log_n);
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+}
+
+// ============================================================================
+// FFT Operations (iterative in-place)
 // ============================================================================
 
 /// Computes the forward negacyclic FFT.
 ///
-/// Implements the Falcon reference recursive FFT for the ring Z[X]/(X^n + 1).
-/// The output ordering matches the Falcon tree structure, ensuring that
-/// adjacent entries (2i, 2i+1) are always conjugate pairs for real inputs.
-/// This property is essential for ffSampling to produce correct signatures.
+/// Implements the Falcon reference FFT for the ring Z[X]/(X^n + 1) using an
+/// iterative bottom-up algorithm with a single scratch buffer. The output
+/// ordering matches the Falcon tree structure, ensuring that adjacent entries
+/// (2i, 2i+1) are always conjugate pairs for real inputs. This property is
+/// essential for ffSampling to produce correct signatures.
 pub fn fft(a: &mut [Complex]) {
     // One-time FP rounding mode verification (debug builds only)
     static FP_CHECKED: AtomicBool = AtomicBool::new(false);
@@ -347,107 +379,83 @@ pub fn fft(a: &mut [Complex]) {
         return;
     }
     debug_assert!(n.is_power_of_two(), "FFT size must be power of 2");
-    let roots = get_roots(n);
-    let result = fft_recursive(a, roots, n);
-    a.copy_from_slice(&result);
-}
 
-/// Recursive FFT implementation.
-///
-/// Splits coefficients into even/odd, recursively transforms each half,
-/// then merges using the Falcon tree roots. Base case at n=2 directly
-/// combines the two coefficients into a conjugate pair.
-fn fft_recursive(coeffs: &[Complex], roots: &[Complex], n: usize) -> Vec<Complex> {
-    if n == 2 {
-        // Base case: [a, b] → [a + i*b, a - i*b]  (conjugate pair)
-        return vec![
-            Complex::new(coeffs[0].re - coeffs[1].im, coeffs[0].im + coeffs[1].re),
-            Complex::new(coeffs[0].re + coeffs[1].im, coeffs[0].im - coeffs[1].re),
-        ];
+    let mut scratch = vec![Complex::ZERO; n];
+
+    // Step 1: Bit-reverse permutation — equivalent to the recursive even/odd
+    // de-interleaving at each level, so that adjacent pairs after permutation
+    // correspond to the base-case inputs.
+    bit_reverse_permute(a);
+
+    // Step 2: Bottom-up butterfly passes from block size 2 up to n.
+    // At each level m, blocks of size m in `a` have their first half (f0) and
+    // second half (f1) merged with interleaving using the tree roots for size m.
+    let mut m = 2;
+    while m <= n {
+        let roots = get_roots(m);
+        let hm = m / 2;
+
+        for block_start in (0..n).step_by(m) {
+            for i in 0..hm {
+                let f0 = a[block_start + i];
+                let f1 = a[block_start + hm + i];
+                let t = roots[2 * i] * f1;
+                scratch[block_start + 2 * i] = f0 + t;
+                scratch[block_start + 2 * i + 1] = f0 - t;
+            }
+        }
+
+        a.copy_from_slice(&scratch);
+        m *= 2;
     }
 
-    let hn = n / 2;
-    // Split into even/odd coefficients
-    let mut even = vec![Complex::ZERO; hn];
-    let mut odd = vec![Complex::ZERO; hn];
-    for i in 0..hn {
-        even[i] = coeffs[2 * i];
-        odd[i] = coeffs[2 * i + 1];
-    }
-
-    // Child roots from cache: roots_n[2i]^2 = roots_{n/2}[i] by construction
-    let child_roots = get_roots(hn);
-
-    let f0 = fft_recursive(&even, child_roots, hn);
-    let f1 = fft_recursive(&odd, child_roots, hn);
-
-    // Zeroize secret-derived temporaries
-    even.zeroize();
-    odd.zeroize();
-
-    // Merge: f_fft[2i] = f0[i] + w[2i]*f1[i], f_fft[2i+1] = f0[i] - w[2i]*f1[i]
-    let mut result = vec![Complex::ZERO; n];
-    for i in 0..hn {
-        let t = roots[2 * i] * f1[i];
-        result[2 * i] = f0[i] + t;
-        result[2 * i + 1] = f0[i] - t;
-    }
-    result
+    // Zeroize scratch — may contain secret-derived data
+    scratch.zeroize();
 }
 
 /// Computes the inverse negacyclic FFT.
 ///
-/// Reverses the Falcon recursive FFT, recovering real polynomial coefficients
-/// from the FFT representation. Uses split_fft (FFT domain) and coefficient-
-/// domain merge operations.
+/// Reverses the Falcon FFT using an iterative top-down algorithm with a single
+/// scratch buffer. Recovers real polynomial coefficients from the FFT
+/// representation.
 pub fn ifft(a: &mut [Complex]) {
     let n = a.len();
     if n <= 1 {
         return;
     }
     debug_assert!(n.is_power_of_two(), "IFFT size must be power of 2");
-    let roots = get_roots(n);
-    let result = ifft_recursive(a, roots, n);
-    a.copy_from_slice(&result);
-}
 
-/// Recursive inverse FFT implementation.
-fn ifft_recursive(fft_vals: &[Complex], roots: &[Complex], n: usize) -> Vec<Complex> {
-    if n == 2 {
-        // Base case: [a+bi, a-bi] → [a, b]  (extract real and imaginary)
-        return vec![
-            Complex::from_real(fft_vals[0].re),
-            Complex::from_real(fft_vals[0].im),
-        ];
+    let mut scratch = vec![Complex::ZERO; n];
+
+    // Step 1: Top-down inverse butterfly passes from block size n down to 2.
+    // Each level reverses the merge step of the forward FFT: de-interleaves
+    // the block into f0 (first half) and f1 (second half) using the conjugate
+    // roots and a factor of 0.5.
+    let mut m = n;
+    while m >= 2 {
+        let roots = get_roots(m);
+        let hm = m / 2;
+
+        for block_start in (0..n).step_by(m) {
+            for i in 0..hm {
+                let even = a[block_start + 2 * i];
+                let odd = a[block_start + 2 * i + 1];
+                scratch[block_start + i] = (even + odd).scale(0.5);
+                scratch[block_start + hm + i] =
+                    ((even - odd) * roots[2 * i].conj()).scale(0.5);
+            }
+        }
+
+        a.copy_from_slice(&scratch);
+        m /= 2;
     }
 
-    let hn = n / 2;
+    // Step 2: Bit-reverse permutation — inverse of the forward FFT's
+    // permutation, recovering standard coefficient order.
+    bit_reverse_permute(a);
 
-    // Split FFT representation into even/odd halves (interleaved)
-    let mut f0 = vec![Complex::ZERO; hn];
-    let mut f1 = vec![Complex::ZERO; hn];
-    for i in 0..hn {
-        f0[i] = (fft_vals[2 * i] + fft_vals[2 * i + 1]).scale(0.5);
-        f1[i] = ((fft_vals[2 * i] - fft_vals[2 * i + 1]) * roots[2 * i].conj()).scale(0.5);
-    }
-
-    // Child roots from cache: roots_n[2i]^2 = roots_{n/2}[i] by construction
-    let child_roots = get_roots(hn);
-
-    let even = ifft_recursive(&f0, child_roots, hn);
-    let odd = ifft_recursive(&f1, child_roots, hn);
-
-    // Zeroize secret-derived temporaries
-    f0.zeroize();
-    f1.zeroize();
-
-    // Merge coefficients: interleave even and odd
-    let mut result = vec![Complex::ZERO; n];
-    for i in 0..hn {
-        result[2 * i] = even[i];
-        result[2 * i + 1] = odd[i];
-    }
-    result
+    // Zeroize scratch — may contain secret-derived data
+    scratch.zeroize();
 }
 
 // ============================================================================
