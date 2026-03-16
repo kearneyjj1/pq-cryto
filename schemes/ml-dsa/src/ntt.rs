@@ -9,7 +9,7 @@
 //! It uses simple modular arithmetic without Montgomery optimization.
 
 use crate::params::{N, Q, ZETA};
-use crate::reduce::freeze;
+use crate::reduce::{freeze, reduce64};
 
 /// The multiplicative inverse of N (256) modulo Q (8380417).
 ///
@@ -19,14 +19,11 @@ use crate::reduce::freeze;
 const N_INV: i32 = 8347681;
 
 /// Computes a * b mod Q with proper handling of negative values.
+/// Constant-time: uses Barrett-based reduce64 instead of `%` operator.
 #[inline]
 fn mulmod(a: i32, b: i32) -> i32 {
     let prod = (a as i64) * (b as i64);
-    let mut r = (prod % Q as i64) as i32;
-    if r < 0 {
-        r += Q;
-    }
-    r
+    reduce64(prod)
 }
 
 /// Computes base^exp mod Q using square-and-multiply.
