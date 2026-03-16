@@ -18,10 +18,10 @@ const MONTGOMERY_R: i64 = 1 << 32;
 /// Computed as: pow(2^32, Q-2, Q)
 pub const R_INV: i32 = 8265825;
 
-/// Montgomery parameter: Q^(-1) mod R (as negative for REDC)
-/// We need -Q^(-1) mod 2^32
-/// Q^(-1) mod 2^32 = 58728449
-pub const Q_INV: i64 = 58728449;
+/// Montgomery parameter: -Q^(-1) mod R for REDC algorithm
+/// -Q^(-1) mod 2^32 = 4236238847
+/// Satisfies: Q * Q_INV ≡ -1 (mod 2^32)
+pub const Q_INV: i64 = 4236238847;
 
 /// R mod Q = 2^32 mod Q = 4193792
 pub const R_MOD_Q: i32 = 4193792;
@@ -33,37 +33,40 @@ pub const R2_MOD_Q: i32 = 2365951;
 /// = floor(4294967296 / 8380417) = 512
 const BARRETT_MU: i64 = 512;
 
+/// High-precision Barrett constant for i64 reduction: floor(2^58 / Q)
+/// Used by reduce64 to handle products up to (Q-1)^2 without overflow.
+const BARRETT_MU_HI: i64 = ((1i128 << 58) / (Q as i128)) as i64;
+
 /// Simple modular reduction of a value in [-Q, 2Q) to [0, Q).
+/// Constant-time: uses arithmetic masks instead of branches.
 #[inline]
 pub fn reduce32(a: i32) -> i32 {
     let mut t = a;
-    if t >= Q {
-        t -= Q;
-    }
-    if t < 0 {
-        t += Q;
-    }
+    // If t >= Q, subtract Q (mask is 1 if Q-1-t is negative)
+    let mask_sub = ((Q - 1 - t) >> 31) & 1;
+    t -= Q * mask_sub;
+    // If t < 0, add Q (mask is 1 if t is negative)
+    let mask_add = (t >> 31) & 1;
+    t += Q * mask_add;
     t
 }
 
 /// Conditional reduction: if a >= Q, subtract Q.
+/// Constant-time: uses arithmetic mask instead of branch.
 #[inline]
 pub fn cond_sub_q(a: i32) -> i32 {
-    if a >= Q {
-        a - Q
-    } else {
-        a
-    }
+    // mask is 1 if a >= Q (i.e., Q-1-a is negative), 0 otherwise
+    let mask = ((Q - 1 - a) >> 31) & 1;
+    a - Q * mask
 }
 
 /// Conditional addition: if a < 0, add Q.
+/// Constant-time: uses arithmetic mask instead of branch.
 #[inline]
 pub fn cond_add_q(a: i32) -> i32 {
-    if a < 0 {
-        a + Q
-    } else {
-        a
-    }
+    // mask is 1 if a < 0, 0 otherwise
+    let mask = (a >> 31) & 1;
+    a + Q * mask
 }
 
 /// Montgomery reduction: compute a * R^(-1) mod Q.
@@ -120,20 +123,28 @@ pub fn barrett_reduce(a: i32) -> i32 {
 }
 
 /// Reduces a 64-bit product to a value in [0, Q).
+/// Constant-time: uses high-precision Barrett reduction instead of `%` operator.
+/// Valid for inputs in [-(Q-1)^2, (Q-1)^2] (covers all products of i32 values in (-Q, Q)).
 #[inline]
 pub fn reduce64(a: i64) -> i32 {
-    let r = (a % (Q as i64)) as i32;
-    cond_add_q(r)
+    // High-precision Barrett: t = floor(a * mu / 2^58)
+    // Uses i128 intermediate to avoid overflow for large products.
+    let t = ((a as i128 * BARRETT_MU_HI as i128) >> 58) as i64;
+    let mut r = (a - t * (Q as i64)) as i32;
+    // r is in [-Q, 2Q) after Barrett approximation, correct with masks
+    let mask_add = (r >> 31) & 1;
+    r += Q * mask_add;
+    let mask_sub = ((Q - 1 - r) >> 31) & 1;
+    r -= Q * mask_sub;
+    r
 }
 
 /// Freeze: reduce a to the canonical representative in [0, Q).
+/// Constant-time: shifts input positive, then uses Barrett reduction.
 #[inline]
 pub fn freeze(a: i32) -> i32 {
-    let mut t = a % Q;
-    if t < 0 {
-        t += Q;
-    }
-    t
+    let a_shifted = ((a as i64) + (2 * Q as i64)) as i32;
+    barrett_reduce(a_shifted)
 }
 
 #[cfg(test)]
@@ -167,7 +178,6 @@ mod tests {
     // Montgomery form is properly integrated.
 
     #[test]
-    #[ignore = "Montgomery form not currently used in NTT"]
     fn test_montgomery_roundtrip() {
         for val in [0, 1, 100, 12345, Q - 1] {
             let mont = to_montgomery(val);
@@ -177,7 +187,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Montgomery form not currently used in NTT"]
     fn test_montgomery_mul() {
         let a = 12345;
         let b = 67890;
@@ -230,7 +239,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Montgomery form not currently used in NTT"]
     fn test_montgomery_reduce_range() {
         // Montgomery reduce should handle the full range used in NTT
         let a: i64 = (Q as i64 - 1) * (Q as i64 - 1);
@@ -240,5 +248,59 @@ mod tests {
         let expected = ((a % (Q as i64)) as i32 * R_INV) % Q;
         let expected = if expected < 0 { expected + Q } else { expected };
         assert_eq!(frozen, expected);
+    }
+
+    #[test]
+    fn test_q_inv_correct() {
+        // Q_INV should satisfy: Q * Q_INV ≡ -1 (mod 2^32)
+        // Using Newton's method (Hensel lifting) to compute -Q^(-1) mod 2^32
+        let q = Q as u64;
+        // Start: x = Q (Q * Q = Q^2 ≡ ? mod 2, Q is odd so Q^2 is odd, Q * 1 = Q ≡ 1 mod 2)
+        // We need x such that Q*x ≡ -1 mod 2^32
+        // First find Q^(-1) mod 2^32 using Newton: x_{n+1} = x_n * (2 - Q * x_n)
+        let mut x: u64 = 1; // Q * 1 ≡ 1 mod 2 (Q is odd)
+        for _ in 0..5 { // 5 iterations: 1 -> 2 -> 4 -> 8 -> 16 -> 32 bits
+            x = x.wrapping_mul(2u64.wrapping_sub(q.wrapping_mul(x)));
+        }
+        let x = x & 0xFFFFFFFF; // mod 2^32
+        // Verify: Q * x ≡ 1 (mod 2^32)
+        assert_eq!((q.wrapping_mul(x)) & 0xFFFFFFFF, 1, "Q^(-1) computation failed");
+        // -Q^(-1) mod 2^32
+        let neg_q_inv = (0u64.wrapping_sub(x)) & 0xFFFFFFFF;
+        // Verify: Q * neg_q_inv ≡ -1 (mod 2^32)
+        assert_eq!((q.wrapping_mul(neg_q_inv)) & 0xFFFFFFFF, 0xFFFFFFFF,
+            "Neg Q^(-1) verification failed");
+        eprintln!("Correct Q_INV (=-Q^{{-1}} mod 2^32) = {}", neg_q_inv);
+        eprintln!("Current Q_INV = {}", Q_INV);
+        assert_eq!(Q_INV as u64, neg_q_inv, "Q_INV constant is incorrect");
+    }
+
+    #[test]
+    fn test_freeze_ct_exhaustive() {
+        // Test freeze for a representative range
+        for a in (-2 * Q)..=(2 * Q) {
+            let expected = {
+                let mut t = a % Q;
+                if t < 0 { t += Q; }
+                t
+            };
+            assert_eq!(freeze(a), expected, "freeze({}) failed", a);
+        }
+    }
+
+    #[test]
+    fn test_reduce64_ct() {
+        // Test reduce64 for products of values in [0, Q)
+        for a in [0i64, 1, 100, Q as i64 - 1, Q as i64, -1, -100, -(Q as i64) + 1] {
+            for b in [0i64, 1, 100, Q as i64 - 1] {
+                let prod = a * b;
+                let expected = {
+                    let mut r = (prod % Q as i64) as i32;
+                    if r < 0 { r += Q; }
+                    r
+                };
+                assert_eq!(reduce64(prod), expected, "reduce64({}) failed", prod);
+            }
+        }
     }
 }
