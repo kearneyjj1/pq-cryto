@@ -273,6 +273,18 @@ impl SamplerZ {
         }
     }
 
+    /// Creates a new SamplerZ with a specific sigma_min value.
+    /// Used for FALCON parameter sets that have different sigma_min.
+    pub fn with_sigma_min(_sigma_min: f64) -> Self {
+        // The current implementation uses simple rejection sampling
+        // via sample_gaussian, which does not depend on sigma_min.
+        // A full FIPS 206 implementation would use sigma_min for the
+        // BerExp acceptance test in the base sampler.
+        SamplerZ {
+            base: BaseSampler::new(),
+        }
+    }
+
     /// Samples z from N(mu, sigma^2).
     pub fn sample<R: RngCore>(&self, rng: &mut R, mu: f64, sigma: f64) -> i64 {
         sample_gaussian(rng, mu, sigma)

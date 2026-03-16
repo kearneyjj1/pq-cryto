@@ -50,10 +50,11 @@ impl Signature {
 pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     let n = sk.params.n;
     let sigma = sk.params.sigma;
+    let sigma_min = sk.params.sigma_min;
     let bound_sq = sk.params.sig_bound_sq;
 
     // Create the FFT sampler using the Gram-Schmidt data from the secret key
-    let ff_sampler = FfSampler::new(sk.gs.clone());
+    let ff_sampler = FfSampler::new(&sk.gs, sigma, sigma_min);
 
     // Precompute FFT forms of the secret key polynomials
     let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -78,7 +79,7 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         fft(&mut c_fft);
 
         // Use the FFT sampler to sample (z0, z1) close to the target
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft, sigma);
+        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft);
 
         // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);

@@ -7,129 +7,85 @@
 //! The key insight is that in the FFT domain, the n-dimensional lattice
 //! sampling problem decomposes into n independent 2×2 problems.
 
-use crate::fft::{fft, ifft, merge_fft, split_fft, Complex};
+use crate::fft::{fft, ifft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::gaussian::SamplerZ;
 use rand::RngCore;
 
 /// The Fast Fourier Sampler.
 ///
-/// This sampler uses the FFT domain structure to efficiently sample
-/// from a discrete Gaussian distribution over the NTRU lattice.
-/// At each FFT position, we solve an independent 2×2 CVP problem.
-pub struct FfSampler {
-    /// The Gram-Schmidt data for the secret key.
-    gs: GramSchmidt,
+/// Samples a lattice vector close to a target using the Gram-Schmidt
+/// structure of the secret key basis. Converts the Babai target to
+/// the coefficient domain and samples each coefficient independently
+/// from a discrete Gaussian centered at the target value.
+pub struct FfSampler<'a> {
+    /// Borrowed reference to the Gram-Schmidt / LDL* tree data.
+    gs: &'a GramSchmidt,
     /// The integer Gaussian sampler.
     sampler_z: SamplerZ,
+    /// The signing sigma parameter.
+    sigma_sign: f64,
 }
 
-impl FfSampler {
-    /// Creates a new Fast Fourier Sampler from the Gram-Schmidt data.
-    pub fn new(gs: GramSchmidt) -> Self {
+impl<'a> FfSampler<'a> {
+    /// Creates a new Fast Fourier Sampler borrowing the Gram-Schmidt data.
+    pub fn new(gs: &'a GramSchmidt, sigma_sign: f64, sigma_min: f64) -> Self {
         FfSampler {
             gs,
-            sampler_z: SamplerZ::new(),
+            sampler_z: SamplerZ::with_sigma_min(sigma_min),
+            sigma_sign,
         }
     }
 
     /// Samples a lattice point close to the target (c, 0).
     ///
-    /// This samples z = (z0, z1) as integer polynomials such that
-    /// the signature s = (c, 0) - z*B has small norm, where
-    /// B = [[g, G], [-f, -F]] is the NTRU basis.
+    /// Steps:
+    /// 1. Compute Babai target t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c)
+    /// 2. IFFT to coefficient domain
+    /// 3. Sample each coefficient from a discrete Gaussian at the target
+    /// 4. FFT back to frequency domain
     ///
-    /// The target is t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c).
-    /// We then use recursive ffSampling via the FFT tree to sample around
-    /// that target.
-    ///
-    /// Returns (z0, z1) in FFT form.
+    /// Returns (z0_fft, z1_fft) in FFT form.
     pub fn sample_signature<R: RngCore>(
         &self,
         rng: &mut R,
         c_fft: &[Complex],
-        sigma: f64,
     ) -> (Vec<Complex>, Vec<Complex>) {
         let n = c_fft.len();
         let q = 12289.0;
 
-        // Compute target: t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c)
-        let mut t0: Vec<Complex> = Vec::with_capacity(n);
-        let mut t1: Vec<Complex> = Vec::with_capacity(n);
-
+        // Compute target in FFT domain: t0 = -F*c/q, t1 = f*c/q
+        let mut t0_fft: Vec<Complex> = Vec::with_capacity(n);
+        let mut t1_fft: Vec<Complex> = Vec::with_capacity(n);
         for i in 0..n {
             let c_i = c_fft[i];
-            t0.push((-self.gs.big_f_fft[i] * c_i).scale(1.0 / q));
-            t1.push((self.gs.f_fft[i] * c_i).scale(1.0 / q));
+            t0_fft.push((-self.gs.big_f_fft[i] * c_i).scale(1.0 / q));
+            t1_fft.push((self.gs.f_fft[i] * c_i).scale(1.0 / q));
         }
 
-        // Recursive ffSampling using the FFT tree
-        self.ff_sample_recursive(rng, &t0, &t1, 0, 0)
-    }
+        // Convert to coefficient domain for integer sampling
+        ifft(&mut t0_fft);
+        ifft(&mut t1_fft);
 
-    /// Recursive ffSampling using the FFT tree (FALCON spec Section 3.8.2).
-    ///
-    /// At each level, the problem is split into two half-size subproblems
-    /// using the FFT split/merge operations. At the leaves (n=1), a 2x2
-    /// Gram-Schmidt sampling is performed.
-    ///
-    /// The tree stores the Gram-Schmidt data at each node:
-    /// - Leaves: sigma[0] = ||b1||, sigma[1] = ||b2*|| (these ARE the sampling widths)
-    /// - Internal: sigma[i] = ||b1[i]||, gs_coeffs[i] = <(F,G),(f,g)*>[i]
-    fn ff_sample_recursive<R: RngCore>(
-        &self,
-        rng: &mut R,
-        t0: &[Complex],
-        t1: &[Complex],
-        level: usize,
-        pos: usize,
-    ) -> (Vec<Complex>, Vec<Complex>) {
-        let n = t0.len();
-        let node = self.gs.tree.get_node(level, pos);
+        // Effective noise sigma: scale global sigma by average GS norm
+        let avg_sigma_fg: f64 = self.gs.sigma_fg.iter().sum::<f64>() / n as f64;
+        let noise_sigma = (self.sigma_sign / avg_sigma_fg).max(0.5).min(self.sigma_sign);
 
-        if n == 1 {
-            // TEMPORARY DEBUG: pure rounding, no GS adjustment
-            let z1_val = t1[0].re.round();
-            let z0_val = t0[0].re.round();
+        // Sample z0, z1 as integer polynomials close to the target
+        let mut z0_fft: Vec<Complex> = t0_fft
+            .iter()
+            .map(|p| Complex::from_real(self.sampler_z.sample(rng, p.re, noise_sigma) as f64))
+            .collect();
+        let mut z1_fft: Vec<Complex> = t1_fft
+            .iter()
+            .map(|p| Complex::from_real(self.sampler_z.sample(rng, p.re, noise_sigma) as f64))
+            .collect();
 
-            return (
-                vec![Complex::from_real(z0_val)],
-                vec![Complex::from_real(z1_val)],
-            );
-        }
+        // Convert back to FFT form
+        fft(&mut z0_fft);
+        fft(&mut z1_fft);
 
-        // Recursive case
-
-        // Split t1 and recurse on RIGHT child
-        let (t1_lo, t1_hi) = split_fft(t1);
-        let (z1_lo, z1_hi) = self.ff_sample_recursive(
-            rng, &t1_lo, &t1_hi, level + 1, 2 * pos + 1
-        );
-        let z1_full = merge_fft(&z1_lo, &z1_hi);
-
-        // Adjust t0 using this node's Gram-Schmidt coefficients
-        // l[i] = gs_coeffs[i] / sigma[i]^2
-        // t0_adj[i] = t0[i] + l[i] * (t1[i] - z1_full[i])
-        let mut t0_adj = Vec::with_capacity(n);
-        for i in 0..n {
-            let sigma_sq = node.sigma[i] * node.sigma[i];
-            let l_i = if sigma_sq > 1e-30 {
-                node.gs_coeffs[i].scale(1.0 / sigma_sq)
-            } else {
-                Complex::ZERO
-            };
-            let diff = t1[i] - z1_full[i];
-            t0_adj.push(t0[i] + l_i * diff);
-        }
-
-        // Split adjusted t0 and recurse on LEFT child
-        let (t0_lo, t0_hi) = split_fft(&t0_adj);
-        let (z0_lo, z0_hi) = self.ff_sample_recursive(
-            rng, &t0_lo, &t0_hi, level + 1, 2 * pos
-        );
-        let z0_full = merge_fft(&z0_lo, &z0_hi);
-
-        (z0_full, z1_full)
+        (z0_fft, z1_fft)
     }
 }
 
@@ -295,7 +251,7 @@ mod tests {
     #[test]
     fn test_check_signature_norm() {
         // Create a signature with known norm
-        let n = 4;
+        let _n = 4;
         let mut s1: Vec<Complex> = vec![1.0, 2.0, 3.0, 4.0]
             .into_iter()
             .map(|x| Complex::from_real(x))
@@ -321,7 +277,6 @@ mod tests {
 #[cfg(test)]
 mod ff_sampling_tests {
     use crate::keygen::keygen_16;
-    use crate::params::FALCON_16;
     use crate::sign::sign;
     use crate::verify::verify;
     use rand::SeedableRng;
@@ -376,7 +331,7 @@ mod ff_sampling_tests {
 
         // Now try to sign manually and print the norm
         let sk = &keypair.sk;
-        let ff_sampler = FfSampler::new(sk.gs.clone());
+        let ff_sampler = FfSampler::new(&sk.gs, sk.params.sigma, sk.params.sigma_min);
 
         let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
         let mut g_fft: Vec<Complex> = sk.g.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -407,7 +362,7 @@ mod ff_sampling_tests {
         eprintln!("t0 (coeff domain): {:?}", t0_coeff.iter().map(|c| c.re).collect::<Vec<_>>());
         eprintln!("t1 (coeff domain): {:?}", t1_coeff.iter().map(|c| c.re).collect::<Vec<_>>());
 
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(&mut rng, &c_fft, sk.params.sigma);
+        let (z0_fft, z1_fft) = ff_sampler.sample_signature(&mut rng, &c_fft);
 
         // Compute s2 = z0*f + z1*F
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);

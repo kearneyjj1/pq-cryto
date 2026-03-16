@@ -8,7 +8,7 @@ use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::field::Zq;
-use crate::gaussian::sample_keygen_gaussian;
+use crate::gaussian::sample_z_gaussian;
 use crate::ntru::ntru_solve;
 use crate::params::{Params, Q, FALCON_512, FALCON_1024};
 use crate::poly::ntt;
@@ -130,7 +130,7 @@ fn max_fg_norm_sq(n: usize) -> i64 {
 /// Generates a random polynomial with small coefficients using discrete Gaussian sampling.
 ///
 /// Coefficients are sampled from a discrete Gaussian distribution N(0, sigma^2)
-/// using rejection sampling (`sample_keygen_gaussian`).
+/// using rejection sampling (`sample_z_gaussian`).
 ///
 /// Note: The FIPS 206 SamplerZ (Algorithm 12) cannot be used here because its
 /// base sampler at sigma_0=1.82 has lighter tails than the keygen sigma≈4.05,
@@ -140,7 +140,7 @@ fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8>
     let mut poly = vec![0i8; n];
 
     for i in 0..n {
-        let z = sample_keygen_gaussian(rng, sigma);
+        let z = sample_z_gaussian(rng, sigma);
         // Clamp to i8 range (coefficients should be small, but clamp for safety)
         poly[i] = z.clamp(-127, 127) as i8;
     }
@@ -368,7 +368,6 @@ mod tests {
             pk_bytes: 64,
             sk_bytes: 128,
             sig_bytes_max: 64,
-            rice_k: 8,
             security_level: 1,
         };
 
