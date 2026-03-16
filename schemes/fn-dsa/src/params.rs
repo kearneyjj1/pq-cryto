@@ -12,6 +12,9 @@
 /// The 2n-th roots of unity exist in Z_q for n up to 1024.
 pub const Q: i32 = 12289;
 
+/// Log2 of the modulus (for bit operations).
+pub const Q_BITS: usize = 14;
+
 /// Parameters for the FN-DSA (FALCON) signature scheme.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -25,10 +28,6 @@ pub struct Params {
     /// This is sigma = 1.17 * sqrt(q) * sqrt(2n / (2n-1)) approximately.
     pub sigma: f64,
 
-    /// Minimum standard deviation at LDL* tree leaves (sigma_min).
-    /// Different for FALCON-512 vs FALCON-1024 per the specification.
-    pub sigma_min: f64,
-
     /// Signature bound squared (for norm checking).
     pub sig_bound_sq: f64,
 
@@ -41,16 +40,29 @@ pub struct Params {
     /// Maximum signature size in bytes.
     pub sig_bytes_max: usize,
 
-    /// Golomb-Rice parameter k for signature compression.
-    /// Low k bits of each coefficient's absolute value are coded in binary;
-    /// the remaining high bits are coded in unary. k = 8 for FALCON-512,
-    /// k = 9 for FALCON-1024.
-    pub rice_k: usize,
-
     /// NIST security level (1 or 5).
     pub security_level: usize,
 }
 
+impl Params {
+    /// Returns the polynomial degree n.
+    #[inline]
+    pub const fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Returns the number of coefficients in the upper triangular representation.
+    #[inline]
+    pub const fn ut_size(&self) -> usize {
+        self.n * (self.n + 1) / 2
+    }
+
+    /// Computes the signature norm bound for verification.
+    #[inline]
+    pub fn sig_bound(&self) -> f64 {
+        self.sig_bound_sq.sqrt()
+    }
+}
 
 /// FALCON-512 parameters (NIST Level 1, ~128-bit security).
 ///
@@ -64,16 +76,13 @@ pub struct Params {
 pub const FALCON_512: Params = Params {
     n: 512,
     log_n: 9,
-    // sigma = 1.17 * sqrt(q) * sqrt(2*512 / (2*512 - 1)) per reference impl
-    sigma: 165.7366171829776,
-    sigma_min: 1.2778336969128337,
-    // sig_bound^2 per FIPS 206: floor(beta^2 * 2n * sigma^2)
-    // = floor(1.1^2 * 2 * 512 * 165.7366171829776^2) = 34,034,727
-    sig_bound_sq: 34_034_727.0,
+    // sigma = 1.17 * sqrt(q) * sqrt(2*512 / (2*512 - 1)) ≈ 165.7366171...
+    sigma: 165.7366171228152,
+    // sig_bound^2 = (1.1 * sigma * sqrt(2n))^2 ≈ 34034726
+    sig_bound_sq: 34034726.0,
     pk_bytes: 897,
     sk_bytes: 1281,
     sig_bytes_max: 809, // Worst case, typical is ~666
-    rice_k: 8,
     security_level: 1,
 };
 
@@ -89,15 +98,13 @@ pub const FALCON_512: Params = Params {
 pub const FALCON_1024: Params = Params {
     n: 1024,
     log_n: 10,
-    // sigma = 1.17 * sqrt(q) * sqrt(2*1024 / (2*1024 - 1)) per reference impl
-    sigma: 168.38857144654395,
-    sigma_min: 1.298280334344292,
+    // sigma = 1.17 * sqrt(q) * sqrt(2*1024 / (2*1024 - 1)) ≈ 168.3885714...
+    sigma: 168.38857144162388,
     // sig_bound^2 = (1.1 * sigma * sqrt(2n))^2
     sig_bound_sq: 70265242.0,
     pk_bytes: 1793,
     sk_bytes: 2305,
     sig_bytes_max: 1577, // Worst case, typical is ~1280
-    rice_k: 9,
     security_level: 5,
 };
 
@@ -106,27 +113,27 @@ pub const FALCON_1024: Params = Params {
 /// - Polynomial degree: n = 16
 /// - This is a toy parameter set for unit testing.
 /// - DO NOT USE IN PRODUCTION.
-///
-/// NOTE: NTRUSolve for small n produces F, G with large coefficients,
-/// so signatures are much larger than standard FALCON. We use a very
-/// relaxed bound that allows valid signatures while still rejecting
-/// wrong-message verifications.
 #[cfg(test)]
 pub const FALCON_16: Params = Params {
     n: 16,
     log_n: 4,
-    sigma: 165.7, // Use FALCON-512 sigma for consistency
-    sigma_min: 1.2778336969128337, // Use FALCON-512 value
-    sig_bound_sq: 6e8, // 600M — relaxed for n=16 (NTRUSolve produces large F,G)
+    sigma: 20.0,
+    // Relaxed bound for n=16: the NTRU basis quality at small n is poor
+    // (||b2*|| >> ||b1||), so ffSampling cannot produce very short signatures.
+    // For proper FALCON (n=512, n=1024), the basis is near-orthogonal and
+    // the standard bounds apply.
+    sig_bound_sq: 500000000.0,
     pk_bytes: 64,
     sk_bytes: 128,
     sig_bytes_max: 64,
-    rice_k: 8,
     security_level: 0, // Not secure
 };
 
+/// Beta parameter for signature compression.
+/// Used in the Golomb-Rice style encoding.
+pub const BETA: f64 = 0.5;
+
 /// Maximum number of signing attempts before giving up.
-/// With proper ffSampling, signing typically succeeds within a few attempts.
 pub const MAX_SIGN_ATTEMPTS: u32 = 100;
 
 /// Nonce size in bytes for signing.
@@ -180,4 +187,16 @@ mod tests {
         assert_eq!(1 << FALCON_1024.log_n, FALCON_1024.n);
     }
 
+    #[test]
+    fn test_sig_bound() {
+        // Check that sig_bound is reasonable (should be around sqrt(sig_bound_sq))
+        let bound_512 = FALCON_512.sig_bound();
+        let bound_1024 = FALCON_1024.sig_bound();
+
+        // FALCON-512: sqrt(34034726) ≈ 5834
+        assert!(bound_512 > 5800.0 && bound_512 < 5900.0);
+
+        // FALCON-1024: sqrt(70265242) ≈ 8382
+        assert!(bound_1024 > 8300.0 && bound_1024 < 8400.0);
+    }
 }
