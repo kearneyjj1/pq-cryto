@@ -6,9 +6,49 @@
 //! FALCON uses floating-point FFT (not integer NTT) for:
 //! - Efficient polynomial multiplication in key generation
 //! - The Fast Fourier Sampling algorithm during signing
+//!
+//! ## Ordering Convention
+//!
+//! This implementation uses the Falcon tree-ordered (interleaved) FFT
+//! matching the reference implementation (tprest/falcon.py, `fft.py`).
+//! The root ordering satisfies two key properties:
+//!
+//! 1. `w[2i+1] = -w[2i]` (adjacent pairs are negations)
+//! 2. `w[i+n/2] = conj(w[i])` (second half conjugates the first half)
+//!
+//! Property 2 ensures that `split_fft` of a Hermitian-symmetric vector
+//! produces Hermitian-symmetric children, preserving real-valuedness
+//! down to the n=1 leaves. This is essential for ffSampling correctness.
 
-use std::f64::consts::PI;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use zeroize::Zeroize;
+
+// Enforce SSE2 on x86/x86_64 for reproducible f64 arithmetic in the signing path.
+// Without SSE2, the x87 FPU uses 80-bit extended precision, producing different
+// FFT results that can cause non-reproducible signing behavior across platforms.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(target_feature = "sse2")
+))]
+compile_error!(
+    "FN-DSA requires SSE2 for reproducible floating-point arithmetic in the signing path. \
+     Compile with RUSTFLAGS=\"-C target-feature=+sse2\" or target an x86_64 platform."
+);
+
+/// Verifies that the floating-point environment uses IEEE 754 round-to-nearest-even,
+/// which is required for FALCON's FFT arithmetic to produce consistent results.
+fn assert_fp_rounding_mode() {
+    // In round-to-nearest-even, 1.0 + epsilon/2 rounds to 1.0 (ties go to even).
+    // In round-up mode this would produce 1.0 + epsilon instead.
+    assert_eq!(
+        1.0f64 + f64::EPSILON / 2.0,
+        1.0f64,
+        "Floating-point rounding mode is not round-to-nearest-even. \
+         FN-DSA requires IEEE 754 default rounding for correct signing."
+    );
+}
 
 /// A complex number with f64 components.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -17,6 +57,13 @@ pub struct Complex {
     pub re: f64,
     /// Imaginary part.
     pub im: f64,
+}
+
+impl Zeroize for Complex {
+    fn zeroize(&mut self) {
+        self.re.zeroize();
+        self.im.zeroize();
+    }
 }
 
 impl Complex {
@@ -80,13 +127,43 @@ impl Complex {
         }
     }
 
-    /// Computes the multiplicative inverse 1/z.
+    /// Computes the multiplicative inverse 1/z using branchless Smith's algorithm.
+    ///
+    /// Avoids computing `re^2 + im^2` which can overflow or underflow for
+    /// extreme magnitudes. Both Smith's paths are computed unconditionally and
+    /// the correct result is selected via IEEE 754 bit manipulation, avoiding
+    /// data-dependent branches that could leak information about secret FFT
+    /// coefficients through timing side-channels.
     #[inline]
     pub fn inverse(self) -> Self {
-        let norm_sq = self.norm_sq();
+        let a = self.re;
+        let b = self.im;
+
+        // Path 1 (|a| >= |b|): r = b/a, d = a + b*r
+        let r1 = b / a;
+        let d1 = a + b * r1;
+        let re1 = 1.0 / d1;
+        let im1 = -r1 / d1;
+
+        // Path 2 (|a| < |b|): r = a/b, d = b + a*r
+        let r2 = a / b;
+        let d2 = b + a * r2;
+        let re2 = r2 / d2;
+        let im2 = -1.0 / d2;
+
+        // Branchless select via IEEE 754 bit manipulation.
+        // For non-negative f64, the unsigned bit representation preserves order.
+        // The invalid path may produce NaN/inf, but SSE2 handles these without
+        // traps and the result is masked out by the select.
+        let abs_a_bits = a.abs().to_bits();
+        let abs_b_bits = b.abs().to_bits();
+        // ge = 1 if |a| >= |b| (unsigned subtraction: borrow iff abs_b > abs_a)
+        let ge = (abs_b_bits.wrapping_sub(abs_a_bits).wrapping_sub(1)) >> 63;
+        let mask = ge.wrapping_neg(); // all-1s if |a| >= |b|, 0 otherwise
+
         Complex {
-            re: self.re / norm_sq,
-            im: -self.im / norm_sq,
+            re: f64::from_bits((re1.to_bits() & mask) | (re2.to_bits() & !mask)),
+            im: f64::from_bits((im1.to_bits() & mask) | (im2.to_bits() & !mask)),
         }
     }
 
@@ -179,39 +256,168 @@ impl From<f64> for Complex {
 }
 
 // ============================================================================
-// FFT Operations
+// Roots of x^n + 1 in Falcon tree ordering
 // ============================================================================
 
-/// Computes the forward negacyclic FFT in-place.
+/// Computes the roots of x^n + 1 in the Falcon recursive tree ordering.
 ///
-/// For polynomials in Z[X]/(X^n + 1), we evaluate at the n-th roots of -1:
-/// omega_k = exp(i * pi * (2k+1) / n) for k = 0..n-1.
+/// The ordering satisfies two key properties (matching tprest/falcon.py
+/// `fft_constants.py`):
 ///
-/// Uses the twist method: pre-multiply by psi^j where psi = exp(i*pi/n),
-/// then apply standard FFT.
+/// 1. `w[2i+1] = -w[2i]`  (adjacent pairs are negations)
+/// 2. `w[i+n/2] = conj(w[i])`  (second half conjugates the first half)
+///
+/// Property 2 ensures that split_fft of a Hermitian-symmetric vector
+/// produces Hermitian-symmetric children, propagating all the way down
+/// to the leaves where values are purely real.
+///
+/// Uses iterative bottom-up construction to avoid deep recursion.
+pub(crate) fn compute_roots(n: usize) -> Vec<Complex> {
+    debug_assert!(n.is_power_of_two() && n >= 2);
+
+    // Build iteratively from n=2 upward
+    let mut current = vec![Complex::I, Complex::new(0.0, -1.0)]; // n=2 base
+    let mut current_n = 2;
+
+    while current_n < n {
+        let next_n = current_n * 2;
+        let hn = current_n; // = next_n / 2
+        let mut roots = vec![Complex::ZERO; next_n];
+
+        // First half: sqrt of parent roots (halving the argument)
+        for i in 0..hn / 2 {
+            let angle = current[i].im.atan2(current[i].re) / 2.0;
+            roots[2 * i] = Complex::exp_i(angle);
+            roots[2 * i + 1] = -roots[2 * i];
+        }
+        // Second half: conjugates of first half
+        for i in 0..hn / 2 {
+            roots[hn + 2 * i] = roots[2 * i].conj();
+            roots[hn + 2 * i + 1] = -roots[hn + 2 * i];
+        }
+
+        current = roots;
+        current_n = next_n;
+    }
+
+    current
+}
+
+/// Cached root tables for all power-of-2 sizes from 2 to 1024.
+/// The upper bound of 1024 matches the maximum FALCON polynomial degree
+/// (FALCON-1024 uses n=1024). Computed once on first access.
+static ROOT_CACHE: OnceLock<Vec<Vec<Complex>>> = OnceLock::new();
+
+/// Returns a reference to the precomputed roots for the given size `n`.
+///
+/// On the first call, computes root tables for all sizes 2, 4, 8, ..., 1024.
+/// All subsequent calls return cached references with zero computation cost.
+/// This eliminates the O(n) trig cost that previously occurred on every
+/// `fft()`, `ifft()`, `split_fft()`, and `merge_fft()` call.
+fn get_roots(n: usize) -> &'static [Complex] {
+    debug_assert!(n.is_power_of_two() && n >= 2 && n <= 1024);
+    let tables = ROOT_CACHE.get_or_init(|| {
+        let max_log = 10; // 2^10 = 1024
+        (0..max_log).map(|i| compute_roots(2 << i)).collect()
+    });
+    // n=2 -> trailing_zeros=1 -> index 0; n=1024 -> trailing_zeros=10 -> index 9
+    &tables[n.trailing_zeros() as usize - 1]
+}
+
+// ============================================================================
+// Bit-reversal helpers
+// ============================================================================
+
+/// Reverses the lower `bits` bits of `x`.
+#[inline]
+fn reverse_bits(x: usize, bits: u32) -> usize {
+    let mut result = 0usize;
+    let mut v = x;
+    for _ in 0..bits {
+        result = (result << 1) | (v & 1);
+        v >>= 1;
+    }
+    result
+}
+
+/// In-place bit-reversal permutation.
+///
+/// The recursive Falcon FFT de-interleaves (even/odd split) at each level,
+/// which is equivalent to a bit-reversal permutation of the indices.
+fn bit_reverse_permute(a: &mut [Complex]) {
+    let n = a.len();
+    let log_n = n.trailing_zeros();
+    for i in 0..n {
+        let j = reverse_bits(i, log_n);
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+}
+
+// ============================================================================
+// FFT Operations (iterative in-place)
+// ============================================================================
+
+/// Computes the forward negacyclic FFT.
+///
+/// Implements the Falcon reference FFT for the ring Z[X]/(X^n + 1) using an
+/// iterative bottom-up algorithm with a single scratch buffer. The output
+/// ordering matches the Falcon tree structure, ensuring that adjacent entries
+/// (2i, 2i+1) are always conjugate pairs for real inputs. This property is
+/// essential for ffSampling to produce correct signatures.
 pub fn fft(a: &mut [Complex]) {
+    // One-time FP rounding mode verification (debug builds only)
+    static FP_CHECKED: AtomicBool = AtomicBool::new(false);
+    if !FP_CHECKED.load(Ordering::Relaxed) {
+        assert_fp_rounding_mode();
+        FP_CHECKED.store(true, Ordering::Relaxed);
+    }
+
     let n = a.len();
     if n <= 1 {
         return;
     }
     debug_assert!(n.is_power_of_two(), "FFT size must be power of 2");
 
-    // Pre-multiply by powers of psi = exp(i * pi / n) for negacyclic
-    // psi is a primitive 2n-th root of unity, so psi^n = -1
-    let psi = Complex::exp_i(PI / (n as f64));
-    let mut psi_power = Complex::ONE;
-    for i in 0..n {
-        a[i] = a[i] * psi_power;
-        psi_power = psi_power * psi;
+    let mut scratch = vec![Complex::ZERO; n];
+
+    // Step 1: Bit-reverse permutation — equivalent to the recursive even/odd
+    // de-interleaving at each level, so that adjacent pairs after permutation
+    // correspond to the base-case inputs.
+    bit_reverse_permute(a);
+
+    // Step 2: Bottom-up butterfly passes from block size 2 up to n.
+    // At each level m, blocks of size m in `a` have their first half (f0) and
+    // second half (f1) merged with interleaving using the tree roots for size m.
+    let mut m = 2;
+    while m <= n {
+        let roots = get_roots(m);
+        let hm = m / 2;
+
+        for block_start in (0..n).step_by(m) {
+            for i in 0..hm {
+                let f0 = a[block_start + i];
+                let f1 = a[block_start + hm + i];
+                let t = roots[2 * i] * f1;
+                scratch[block_start + 2 * i] = f0 + t;
+                scratch[block_start + 2 * i + 1] = f0 - t;
+            }
+        }
+
+        a.copy_from_slice(&scratch);
+        m *= 2;
     }
 
-    // Standard Cooley-Tukey FFT
-    fft_core(a);
+    // Zeroize scratch — may contain secret-derived data
+    scratch.zeroize();
 }
 
-/// Computes the inverse negacyclic FFT in-place.
+/// Computes the inverse negacyclic FFT.
 ///
-/// Applies standard IFFT then post-multiplies by psi^(-j) to undo the twist.
+/// Reverses the Falcon FFT using an iterative top-down algorithm with a single
+/// scratch buffer. Recovers real polynomial coefficients from the FFT
+/// representation.
 pub fn ifft(a: &mut [Complex]) {
     let n = a.len();
     if n <= 1 {
@@ -219,150 +425,84 @@ pub fn ifft(a: &mut [Complex]) {
     }
     debug_assert!(n.is_power_of_two(), "IFFT size must be power of 2");
 
-    // Standard inverse FFT
-    ifft_core(a);
+    let mut scratch = vec![Complex::ZERO; n];
 
-    // Post-multiply by inverse powers of psi = exp(-i * pi / n)
-    let psi_inv = Complex::exp_i(-PI / (n as f64));
-    let mut psi_power = Complex::ONE;
-    for i in 0..n {
-        a[i] = a[i] * psi_power;
-        psi_power = psi_power * psi_inv;
-    }
-}
+    // Step 1: Top-down inverse butterfly passes from block size n down to 2.
+    // Each level reverses the merge step of the forward FFT: de-interleaves
+    // the block into f0 (first half) and f1 (second half) using the conjugate
+    // roots and a factor of 0.5.
+    let mut m = n;
+    while m >= 2 {
+        let roots = get_roots(m);
+        let hm = m / 2;
 
-/// Standard forward FFT (Cooley-Tukey, in-place, radix-2).
-fn fft_core(a: &mut [Complex]) {
-    let n = a.len();
-    let log_n = n.trailing_zeros() as usize;
-
-    // Bit-reversal permutation
-    for i in 0..n {
-        let j = bit_reverse(i, log_n);
-        if i < j {
-            a.swap(i, j);
-        }
-    }
-
-    // Cooley-Tukey butterflies
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let angle = -2.0 * PI / (len as f64);
-        let w_len = Complex::exp_i(angle);
-
-        for start in (0..n).step_by(len) {
-            let mut w = Complex::ONE;
-            for j in 0..half {
-                let u = a[start + j];
-                let t = w * a[start + j + half];
-                a[start + j] = u + t;
-                a[start + j + half] = u - t;
-                w = w * w_len;
+        for block_start in (0..n).step_by(m) {
+            for i in 0..hm {
+                let even = a[block_start + 2 * i];
+                let odd = a[block_start + 2 * i + 1];
+                scratch[block_start + i] = (even + odd).scale(0.5);
+                scratch[block_start + hm + i] =
+                    ((even - odd) * roots[2 * i].conj()).scale(0.5);
             }
         }
-        len *= 2;
-    }
-}
 
-/// Standard inverse FFT (in-place).
-fn ifft_core(a: &mut [Complex]) {
-    let n = a.len();
-    let log_n = n.trailing_zeros() as usize;
-
-    // Bit-reversal permutation
-    for i in 0..n {
-        let j = bit_reverse(i, log_n);
-        if i < j {
-            a.swap(i, j);
-        }
+        a.copy_from_slice(&scratch);
+        m /= 2;
     }
 
-    // Inverse butterflies (conjugate twiddle factors)
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let angle = 2.0 * PI / (len as f64);  // Positive angle for inverse
-        let w_len = Complex::exp_i(angle);
+    // Step 2: Bit-reverse permutation — inverse of the forward FFT's
+    // permutation, recovering standard coefficient order.
+    bit_reverse_permute(a);
 
-        for start in (0..n).step_by(len) {
-            let mut w = Complex::ONE;
-            for j in 0..half {
-                let u = a[start + j];
-                let t = w * a[start + j + half];
-                a[start + j] = u + t;
-                a[start + j + half] = u - t;
-                w = w * w_len;
-            }
-        }
-        len *= 2;
-    }
-
-    // Scale by 1/n
-    let scale = 1.0 / (n as f64);
-    for x in a.iter_mut() {
-        *x = x.scale(scale);
-    }
-}
-
-/// Bit-reversal of an index.
-#[inline]
-fn bit_reverse(mut x: usize, bits: usize) -> usize {
-    let mut result = 0;
-    for _ in 0..bits {
-        result = (result << 1) | (x & 1);
-        x >>= 1;
-    }
-    result
+    // Zeroize scratch — may contain secret-derived data
+    scratch.zeroize();
 }
 
 // ============================================================================
 // Split/Merge Operations (for FFT tree)
 // ============================================================================
 
-/// Splits an FFT representation into two halves.
+/// Splits an FFT representation into two halves (interleaved).
 ///
-/// Given f in FFT form, computes (f0, f1) where f(x) = f0(x^2) + x * f1(x^2).
-/// This is the key operation for tree-based sampling.
+/// Uses the Falcon tree ordering where adjacent pairs (2i, 2i+1) are always
+/// conjugate pairs for real polynomials. This ensures that children of a
+/// Hermitian-symmetric parent are also Hermitian-symmetric, and at the
+/// n=1 leaves, values are purely real.
+///
+/// The twiddle factor conj(w[2i]) is the conjugate of the tree root at
+/// position 2i. For the tree root convention where w[2i+1] = -w[2i]:
+///   f0[i] = (f[2i] + f[2i+1]) / 2
+///   f1[i] = (f[2i] - f[2i+1]) * conj(w[2i]) / 2
 pub fn split_fft(f: &[Complex]) -> (Vec<Complex>, Vec<Complex>) {
     let n = f.len();
     let hn = n / 2;
 
+    let roots = get_roots(n);
     let mut f0 = vec![Complex::ZERO; hn];
     let mut f1 = vec![Complex::ZERO; hn];
 
     for i in 0..hn {
-        let a_plus = f[i];
-        let a_minus = f[i + hn];
-
-        // Twiddle factor for the split
-        let angle = -PI * (i as f64) / (n as f64);
-        let zeta = Complex::exp_i(angle);
-
-        f0[i] = (a_plus + a_minus).scale(0.5);
-        f1[i] = ((a_plus - a_minus) * zeta).scale(0.5);
+        f0[i] = (f[2 * i] + f[2 * i + 1]).scale(0.5);
+        f1[i] = ((f[2 * i] - f[2 * i + 1]) * roots[2 * i].conj()).scale(0.5);
     }
 
     (f0, f1)
 }
 
-/// Merges two FFT halves back into a full FFT representation.
+/// Merges two FFT halves back into a full FFT representation (interleaved).
 ///
 /// This is the inverse of split_fft.
 pub fn merge_fft(f0: &[Complex], f1: &[Complex]) -> Vec<Complex> {
     let hn = f0.len();
     let n = hn * 2;
 
+    let roots = get_roots(n);
     let mut f = vec![Complex::ZERO; n];
 
     for i in 0..hn {
-        // Inverse twiddle factor
-        let angle = PI * (i as f64) / (n as f64);
-        let zeta = Complex::exp_i(angle);
-
-        let t = f1[i] * zeta;
-        f[i] = f0[i] + t;
-        f[i + hn] = f0[i] - t;
+        let t = roots[2 * i] * f1[i];
+        f[2 * i] = f0[i] + t;
+        f[2 * i + 1] = f0[i] - t;
     }
 
     f
@@ -373,6 +513,7 @@ pub fn merge_fft(f0: &[Complex], f1: &[Complex]) -> Vec<Complex> {
 // ============================================================================
 
 /// Converts a polynomial from coefficient form to FFT form.
+#[cfg(test)]
 pub fn poly_to_fft(coeffs: &[i16], n: usize) -> Vec<Complex> {
     let mut f: Vec<Complex> = coeffs.iter().map(|&c| Complex::from_real(c as f64)).collect();
     f.resize(n, Complex::ZERO);
@@ -381,44 +522,23 @@ pub fn poly_to_fft(coeffs: &[i16], n: usize) -> Vec<Complex> {
 }
 
 /// Converts from FFT form back to (approximate) integer coefficients.
+///
+/// Clamps values to the i16 range to prevent undefined truncation.
+#[cfg(test)]
 pub fn fft_to_poly(fft_coeffs: &[Complex]) -> Vec<i16> {
     let mut f = fft_coeffs.to_vec();
     ifft(&mut f);
-    f.iter().map(|c| c.re.round() as i16).collect()
+    f.iter().map(|c| {
+        let rounded = c.re.round();
+        rounded.clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    }).collect()
 }
 
 /// Multiplies two polynomials in FFT form (pointwise).
+#[cfg(test)]
 pub fn fft_mul(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).collect()
-}
-
-/// Adds two polynomials in FFT form.
-pub fn fft_add(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
-}
-
-/// Subtracts two polynomials in FFT form.
-pub fn fft_sub(a: &[Complex], b: &[Complex]) -> Vec<Complex> {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(&x, &y)| x - y).collect()
-}
-
-/// Negates a polynomial in FFT form.
-pub fn fft_neg(a: &[Complex]) -> Vec<Complex> {
-    a.iter().map(|&x| -x).collect()
-}
-
-/// Computes the adjoint (conjugate) of a polynomial in FFT form.
-pub fn fft_adj(a: &[Complex]) -> Vec<Complex> {
-    let n = a.len();
-    let mut result = vec![Complex::ZERO; n];
-    result[0] = a[0].conj();
-    for i in 1..n {
-        result[i] = a[n - i].conj();
-    }
-    result
 }
 
 #[cfg(test)]
@@ -471,6 +591,7 @@ mod tests {
 
     #[test]
     fn test_complex_exp_i() {
+        use std::f64::consts::PI;
         // e^(i*0) = 1
         let a = Complex::exp_i(0.0);
         assert!(complex_approx_eq(a, Complex::ONE));
@@ -490,15 +611,6 @@ mod tests {
         let a_inv = a.inverse();
         let product = a * a_inv;
         assert!(complex_approx_eq(product, Complex::ONE));
-    }
-
-    #[test]
-    fn test_bit_reverse() {
-        assert_eq!(bit_reverse(0, 3), 0);
-        assert_eq!(bit_reverse(1, 3), 4);
-        assert_eq!(bit_reverse(2, 3), 2);
-        assert_eq!(bit_reverse(3, 3), 6);
-        assert_eq!(bit_reverse(4, 3), 1);
     }
 
     #[test]
@@ -582,6 +694,41 @@ mod tests {
                 "Poly FFT roundtrip failed at {}",
                 i
             );
+        }
+    }
+
+    #[test]
+    fn test_root_cache_consistency() {
+        // Verify cached roots match freshly computed roots for all sizes
+        for log_n in 1..=10 {
+            let n = 1 << log_n;
+            let cached = get_roots(n);
+            let fresh = compute_roots(n);
+            assert_eq!(cached.len(), fresh.len(), "Length mismatch for n={}", n);
+            for i in 0..n {
+                assert!(
+                    (cached[i].re - fresh[i].re).abs() < 1e-14 &&
+                    (cached[i].im - fresh[i].im).abs() < 1e-14,
+                    "Root mismatch at n={}, i={}: cached={:?} vs fresh={:?}",
+                    n, i, cached[i], fresh[i]
+                );
+            }
+        }
+
+        // Verify parent-child squared-root invariant: roots_n[2i]^2 == roots_{n/2}[i]
+        for log_n in 2..=10 {
+            let n = 1 << log_n;
+            let hn = n / 2;
+            let parent = get_roots(n);
+            let child = get_roots(hn);
+            for i in 0..hn {
+                let squared = parent[2 * i] * parent[2 * i];
+                assert!(
+                    (squared.re - child[i].re).abs() < 1e-12 &&
+                    (squared.im - child[i].im).abs() < 1e-12,
+                    "Parent-child root invariant failed at n={}, i={}", n, i
+                );
+            }
         }
     }
 

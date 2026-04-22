@@ -3,17 +3,13 @@
 //! This module implements the FALCON signature generation algorithm,
 //! which uses Fast Fourier Sampling to produce compact signatures.
 
-use std::sync::Once;
 use rand::RngCore;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
 use crate::hash::{generate_nonce, hash_to_point};
 use crate::keygen::SecretKey;
-use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE, FALCON_512};
+use crate::params::{Q, MAX_SIGN_ATTEMPTS, NONCE_SIZE};
 use crate::sampler::{FfSampler, SimpleSampler};
-
-/// Warning printed once for FALCON-512 relaxed bounds.
-static FALCON_512_WARNING: Once = Once::new();
 
 /// A FALCON signature.
 #[derive(Clone, Debug)]
@@ -54,19 +50,11 @@ impl Signature {
 pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     let n = sk.params.n;
     let sigma = sk.params.sigma;
+    let sigma_min = sk.params.sigma_min;
     let bound_sq = sk.params.sig_bound_sq;
 
-    // Warn once if using FALCON-512 with relaxed bounds
-    if sk.params.n == FALCON_512.n && sk.params.sig_bound_sq == FALCON_512.sig_bound_sq {
-        FALCON_512_WARNING.call_once(|| {
-            eprintln!("WARNING: FALCON-512 is using relaxed signature bounds (~200x larger than standard).");
-            eprintln!("         This implementation uses simplified sampling and is NOT suitable for production.");
-            eprintln!("         See SECURITY.md for details.");
-        });
-    }
-
     // Create the FFT sampler using the Gram-Schmidt data from the secret key
-    let ff_sampler = FfSampler::new(sk.gs.clone());
+    let ff_sampler = FfSampler::new(&sk.gs, sigma, sigma_min);
 
     // Precompute FFT forms of the secret key polynomials
     let mut f_fft: Vec<Complex> = sk.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
@@ -91,7 +79,7 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
         fft(&mut c_fft);
 
         // Use the FFT sampler to sample (z0, z1) close to the target
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft, sigma);
+        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft);
 
         // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
         let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);

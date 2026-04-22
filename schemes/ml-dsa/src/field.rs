@@ -5,6 +5,7 @@
 //! efficient NTT operations.
 
 use crate::params::Q;
+use crate::reduce;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// An element of the ring Z_q where q = 8380417.
@@ -120,25 +121,17 @@ impl Zq {
 }
 
 /// Reduces a value to [0, q).
+/// Constant-time: delegates to the constant-time reduce64 for arbitrary i32 inputs.
 #[inline]
-fn reduce(mut a: i32) -> i32 {
-    // Handle negative values
-    a = a % Q;
-    if a < 0 {
-        a += Q;
-    }
-    a
+fn reduce(a: i32) -> i32 {
+    reduce::reduce64(a as i64)
 }
 
 /// Reduces an i64 product to i32 in [0, q).
+/// Constant-time: delegates to the constant-time reduce64 in reduce module.
 #[inline]
 fn reduce64(a: i64) -> i32 {
-    let r = (a % (Q as i64)) as i32;
-    if r < 0 {
-        r + Q
-    } else {
-        r
-    }
+    reduce::reduce64(a)
 }
 
 impl Add for Zq {
@@ -147,12 +140,8 @@ impl Add for Zq {
     #[inline]
     fn add(self, rhs: Zq) -> Zq {
         let sum = self.0 + rhs.0;
-        // Conditional subtraction for reduction
-        if sum >= Q {
-            Zq(sum - Q)
-        } else {
-            Zq(sum)
-        }
+        // Constant-time conditional subtraction
+        Zq(reduce::cond_sub_q(sum))
     }
 }
 
@@ -169,11 +158,8 @@ impl Sub for Zq {
     #[inline]
     fn sub(self, rhs: Zq) -> Zq {
         let diff = self.0 - rhs.0;
-        if diff < 0 {
-            Zq(diff + Q)
-        } else {
-            Zq(diff)
-        }
+        // Constant-time conditional addition
+        Zq(reduce::cond_add_q(diff))
     }
 }
 
@@ -221,7 +207,7 @@ impl From<i32> for Zq {
 impl From<u32> for Zq {
     #[inline]
     fn from(val: u32) -> Self {
-        Zq::new((val % (Q as u32)) as i32)
+        Zq::new(val as i32)
     }
 }
 

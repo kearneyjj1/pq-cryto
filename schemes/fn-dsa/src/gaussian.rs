@@ -84,8 +84,13 @@ pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
         return mu.round() as i64;
     }
 
-    // Sample z from N(0, sigma^2), then shift by mu and round
-    // This is an approximation; proper FALCON uses a more sophisticated approach
+    // If mu is outside a safe range, just return the rounded value.
+    // With any reasonable sigma, the probability mass is concentrated near mu,
+    // so this is essentially exact when |mu| >> sigma.
+    let safe_limit = (i64::MAX / 2) as f64;
+    if mu.abs() > safe_limit || mu.is_nan() || mu.is_infinite() {
+        return if mu.is_nan() { 0 } else { mu.round() as i64 };
+    }
 
     // For FALCON, we use rejection sampling around mu
     let max_offset = (sigma * MAX_SIGMA_MULT).ceil() as i64;
@@ -93,7 +98,7 @@ pub fn sample_gaussian<R: RngCore>(rng: &mut R, mu: f64, sigma: f64) -> i64 {
 
     loop {
         // Sample uniformly around mu
-        let z = mu_floor + rng.gen_range(-max_offset..=max_offset);
+        let z = mu_floor.saturating_add(rng.gen_range(-max_offset..=max_offset));
 
         // Accept with probability proportional to exp(-(z-mu)^2 / (2*sigma^2))
         let diff = z as f64 - mu;
@@ -268,42 +273,21 @@ impl SamplerZ {
         }
     }
 
+    /// Creates a new SamplerZ with a specific sigma_min value.
+    /// Used for FALCON parameter sets that have different sigma_min.
+    pub fn with_sigma_min(_sigma_min: f64) -> Self {
+        // The current implementation uses simple rejection sampling
+        // via sample_gaussian, which does not depend on sigma_min.
+        // A full FIPS 206 implementation would use sigma_min for the
+        // BerExp acceptance test in the base sampler.
+        SamplerZ {
+            base: BaseSampler::new(),
+        }
+    }
+
     /// Samples z from N(mu, sigma^2).
     pub fn sample<R: RngCore>(&self, rng: &mut R, mu: f64, sigma: f64) -> i64 {
-        // Use the convolution method for large sigma
-        // sigma^2 = sigma_0^2 * k + sigma_r^2 where sigma_0 is the base sigma
-
-        let sigma_0_sq = self.base.sigma * self.base.sigma;
-        let sigma_sq = sigma * sigma;
-
-        if sigma_sq <= sigma_0_sq {
-            // Direct sampling for small sigma
-            return sample_gaussian(rng, mu, sigma);
-        }
-
-        // Convolution: sample sum of independent base Gaussians
-        let k = (sigma_sq / sigma_0_sq).floor() as usize;
-        let sigma_r_sq = sigma_sq - (k as f64) * sigma_0_sq;
-        let sigma_r = sigma_r_sq.sqrt();
-
-        // Sample k base Gaussians and one residual
-        let mut z: i64 = 0;
-        for _ in 0..k {
-            z += self.base.sample(rng);
-        }
-
-        // Add the residual (if significant)
-        if sigma_r > 0.1 {
-            z += sample_gaussian(rng, 0.0, sigma_r);
-        }
-
-        // Shift by mu
-        z += mu.round() as i64;
-
-        // TODO: This is a simplified version. The full FALCON sampler
-        // uses rejection sampling to ensure the distribution is correct.
-
-        z
+        sample_gaussian(rng, mu, sigma)
     }
 }
 

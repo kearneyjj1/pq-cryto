@@ -2,37 +2,10 @@
 
 use std::fmt;
 
-/// Specific reasons why signature verification failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerificationFailure {
-    /// The signature norm exceeds the allowed bound.
-    NormBoundExceeded,
-    /// The recovered hash doesn't match expected value.
-    HashMismatch,
-    /// The signature polynomial has invalid coefficients.
-    InvalidCoefficients,
-    /// Generic verification failure (unspecified reason).
-    Generic,
-}
-
-impl fmt::Display for VerificationFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            VerificationFailure::NormBoundExceeded => write!(f, "signature norm exceeded"),
-            VerificationFailure::HashMismatch => write!(f, "hash mismatch"),
-            VerificationFailure::InvalidCoefficients => write!(f, "invalid coefficients"),
-            VerificationFailure::Generic => write!(f, "verification failed"),
-        }
-    }
-}
-
 /// Errors that can occur during FN-DSA operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FnDsaError {
-    /// Signature verification failed with a specific reason.
-    VerificationFailed(VerificationFailure),
-
-    /// The signature failed verification (legacy variant).
+    /// The signature failed verification.
     InvalidSignature,
 
     /// Signing failed after the specified number of attempts.
@@ -47,12 +20,6 @@ pub enum FnDsaError {
         reason: &'static str,
     },
 
-    /// The parameters are invalid.
-    InvalidParams {
-        /// Description of why the parameters are invalid.
-        reason: &'static str,
-    },
-
     /// Invalid input was provided.
     InvalidInput {
         /// The field that was invalid.
@@ -61,20 +28,11 @@ pub enum FnDsaError {
         reason: &'static str,
     },
 
-    /// Error decoding data.
-    DecodingError {
-        /// Context about what was being decoded.
-        context: &'static str,
-    },
-
     /// Key generation failed.
     KeygenFailed {
         /// Description of why keygen failed.
         reason: &'static str,
     },
-
-    /// Gaussian sampling failed.
-    SamplingFailed,
 
     /// NTRU solve failed to find a solution.
     NtruSolveFailed,
@@ -83,21 +41,15 @@ pub enum FnDsaError {
 impl fmt::Display for FnDsaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FnDsaError::VerificationFailed(reason) => {
-                write!(f, "signature verification failed: {}", reason)
-            }
             FnDsaError::InvalidSignature => write!(f, "invalid signature"),
             FnDsaError::SigningFailed { attempts } => {
                 write!(f, "signing failed after {} attempts", attempts)
             }
             FnDsaError::InvalidKey { reason } => write!(f, "invalid key: {}", reason),
-            FnDsaError::InvalidParams { reason } => write!(f, "invalid parameters: {}", reason),
             FnDsaError::InvalidInput { field, reason } => {
                 write!(f, "invalid {}: {}", field, reason)
             }
-            FnDsaError::DecodingError { context } => write!(f, "decoding error: {}", context),
             FnDsaError::KeygenFailed { reason } => write!(f, "key generation failed: {}", reason),
-            FnDsaError::SamplingFailed => write!(f, "Gaussian sampling failed"),
             FnDsaError::NtruSolveFailed => write!(f, "NTRU solve failed to find solution"),
         }
     }

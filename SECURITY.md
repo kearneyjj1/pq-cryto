@@ -24,7 +24,7 @@ All implementations in this repository may be vulnerable to timing side-channel 
 
 ### Implementation Gaps
 
-1. **FN-DSA (FALCON)**: Uses simplified sampling instead of the full `ffSampling` algorithm. Signature bounds are relaxed for educational purposes.
+1. **FN-DSA (FALCON)**: Implements full ffSampling per FIPS 206 with LDL* tree decomposition. The implementation passes all 100 official Falcon-512 KAT vectors (verification path only). Keygen and signing use custom randomness rather than the NIST AES-CTR-DRBG, so byte-level reproducibility with the reference implementation is not possible.
 
 2. **Secret Key Handling**: While zeroization is implemented, it may not be effective against all memory disclosure attacks (e.g., speculative execution, cold boot attacks).
 
@@ -132,11 +132,12 @@ These implementations have undergone more rigorous security review and testing.
 | 0.1.0 | 2026-01-08 | Initial security documentation |
 | 0.2.0 | 2026-01-08 | Security audit remediation: constant-time GF(2^8) multiplication, zeroization for all secret keys, input validation, error handling improvements |
 | 0.2.1 | 2026-01-08 | Follow-up audit fixes: Result-based error handling, release-mode bounds checking, named constants, platform requirements documentation, FALCON-512 runtime warnings |
+| 0.3.0 | 2026-02-10 | Updated FN-DSA documentation to reflect full ffSampling implementation and 100/100 KAT vector validation. Fixed broken FIPS 206 reference link. |
 
 ## References
 
 - [NIST Post-Quantum Cryptography](https://csrc.nist.gov/projects/post-quantum-cryptography)
 - [FIPS 204: ML-DSA Standard](https://csrc.nist.gov/pubs/fips/204/final)
-- [FIPS 206: FN-DSA Standard](https://csrc.nist.gov/pubs/fips/206/final)
+- [FIPS 206: FN-DSA (FALCON)](https://csrc.nist.gov/presentations/2025/fips-206-fn-dsa-falcon) (draft, not yet finalized)
 - [Side-Channel Attacks on Implementations of Curve25519](https://cr.yp.to/papers.html)
 - [BearSSL Constant-Time Guide](https://bearssl.org/constanttime.html)

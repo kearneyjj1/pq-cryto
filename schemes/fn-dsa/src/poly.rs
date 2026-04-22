@@ -3,9 +3,10 @@
 //! This module provides polynomial operations in the ring Z_q[X]/(X^n + 1)
 //! where q = 12289 and n is 512 or 1024.
 
-use crate::fft::{fft, fft_add, fft_mul, fft_sub, ifft, Complex};
+use crate::fft::{fft, ifft, Complex};
 use crate::field::Zq;
 use crate::params::Q;
+use zeroize::Zeroize;
 
 /// A polynomial in Z_q[X]/(X^n + 1).
 ///
@@ -14,6 +15,12 @@ use crate::params::Q;
 pub struct Poly {
     /// Polynomial coefficients in [0, q-1].
     pub coeffs: Vec<Zq>,
+}
+
+impl Drop for Poly {
+    fn drop(&mut self) {
+        self.coeffs.zeroize();
+    }
 }
 
 impl Poly {
@@ -31,13 +38,6 @@ impl Poly {
         }
     }
 
-    /// Creates a polynomial from i8 coefficients (for small polynomials like f, g).
-    pub fn from_i8(coeffs: &[i8]) -> Self {
-        Poly {
-            coeffs: coeffs.iter().map(|&c| Zq::new(c as i32)).collect(),
-        }
-    }
-
     /// Creates a polynomial from Zq coefficients.
     pub fn from_zq(coeffs: Vec<Zq>) -> Self {
         Poly { coeffs }
@@ -47,12 +47,6 @@ impl Poly {
     #[inline]
     pub fn len(&self) -> usize {
         self.coeffs.len()
-    }
-
-    /// Returns true if the polynomial is empty (shouldn't happen in practice).
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.coeffs.is_empty()
     }
 
     /// Returns true if all coefficients are zero.
@@ -150,9 +144,11 @@ impl Poly {
     }
 
     /// Multiplies two polynomials in Z_q[X]/(X^n + 1) using FFT.
+    ///
+    /// Uses floating-point FFT — fast but subject to rounding error.
+    /// For exact arithmetic, use [`mul_ntt`](Self::mul_ntt) instead.
     pub fn mul(&self, other: &Poly) -> Poly {
         debug_assert_eq!(self.len(), other.len());
-        let n = self.len();
 
         // Convert to FFT form
         let mut a_fft: Vec<Complex> = self
@@ -192,30 +188,51 @@ impl Poly {
                 .collect(),
         }
     }
+
+    /// Multiplies two polynomials in Z_q[X]/(X^n + 1) using NTT.
+    ///
+    /// Uses exact modular arithmetic via the Number Theoretic Transform.
+    /// No floating-point rounding — results are exact in Z_q. This is the
+    /// correct method for verification where exactness matters.
+    ///
+    /// Complexity: O(n log n) via Cooley-Tukey / Gentleman-Sande butterflies.
+    pub fn mul_ntt(&self, other: &Poly) -> Poly {
+        debug_assert_eq!(self.len(), other.len());
+        let n = self.len();
+
+        let a_ntt = ntt(&self.coeffs, n);
+        let b_ntt = ntt(&other.coeffs, n);
+        let c_ntt: Vec<Zq> = (0..n).map(|i| a_ntt[i] * b_ntt[i]).collect();
+
+        Poly {
+            coeffs: intt(&c_ntt, n),
+        }
+    }
 }
 
 // ============================================================================
-// Polynomial FFT Representation
+// Polynomial FFT Representation (test-only)
 // ============================================================================
 
 /// A polynomial in FFT form (evaluated at the n-th roots of -1).
 ///
 /// Operations in FFT form are pointwise and thus O(n) instead of O(n^2).
+/// Only used in tests — production code works directly with `Vec<Complex>`.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct PolyFft {
-    /// FFT coefficients (complex evaluations).
     pub coeffs: Vec<Complex>,
 }
 
-impl PolyFft {
-    /// Creates a zero polynomial in FFT form.
-    pub fn zero(n: usize) -> Self {
-        PolyFft {
-            coeffs: vec![Complex::ZERO; n],
-        }
+#[cfg(test)]
+impl Drop for PolyFft {
+    fn drop(&mut self) {
+        self.coeffs.zeroize();
     }
+}
 
-    /// Converts a polynomial to FFT form.
+#[cfg(test)]
+impl PolyFft {
     pub fn from_poly(p: &Poly) -> Self {
         let mut coeffs: Vec<Complex> = p
             .coeffs
@@ -226,27 +243,6 @@ impl PolyFft {
         PolyFft { coeffs }
     }
 
-    /// Converts from i8 coefficients directly to FFT form.
-    pub fn from_i8(coeffs: &[i8]) -> Self {
-        let mut fft_coeffs: Vec<Complex> =
-            coeffs.iter().map(|&c| Complex::from_real(c as f64)).collect();
-        fft(&mut fft_coeffs);
-        PolyFft { coeffs: fft_coeffs }
-    }
-
-    /// Converts from f64 coefficients directly to FFT form.
-    pub fn from_f64(coeffs: &[f64]) -> Self {
-        let mut fft_coeffs: Vec<Complex> =
-            coeffs.iter().map(|&c| Complex::from_real(c)).collect();
-        fft(&mut fft_coeffs);
-        PolyFft { coeffs: fft_coeffs }
-    }
-
-    /// Converts back to a polynomial (rounds coefficients).
-    ///
-    /// # Safety
-    ///
-    /// Uses clamping to prevent integer overflow when converting from f64 to i32.
     pub fn to_poly(&self) -> Poly {
         let mut coeffs = self.coeffs.clone();
         ifft(&mut coeffs);
@@ -255,7 +251,6 @@ impl PolyFft {
                 .iter()
                 .map(|c| {
                     let rounded = c.re.round();
-                    // Clamp to i32 range to prevent overflow on cast
                     let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
                     Zq::new(clamped)
                 })
@@ -263,72 +258,19 @@ impl PolyFft {
         }
     }
 
-    /// Converts to f64 coefficients (no modular reduction).
-    pub fn to_f64(&self) -> Vec<f64> {
-        let mut coeffs = self.coeffs.clone();
-        ifft(&mut coeffs);
-        coeffs.iter().map(|c| c.re).collect()
-    }
-
-    /// Returns the number of coefficients.
-    #[inline]
     pub fn len(&self) -> usize {
         self.coeffs.len()
     }
 
-    /// Returns true if empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.coeffs.is_empty()
-    }
-
-    /// Adds two polynomials in FFT form (pointwise).
-    pub fn add(&self, other: &PolyFft) -> PolyFft {
-        PolyFft {
-            coeffs: fft_add(&self.coeffs, &other.coeffs),
-        }
-    }
-
-    /// Subtracts two polynomials in FFT form (pointwise).
-    pub fn sub(&self, other: &PolyFft) -> PolyFft {
-        PolyFft {
-            coeffs: fft_sub(&self.coeffs, &other.coeffs),
-        }
-    }
-
-    /// Multiplies two polynomials in FFT form (pointwise).
     pub fn mul(&self, other: &PolyFft) -> PolyFft {
         PolyFft {
-            coeffs: fft_mul(&self.coeffs, &other.coeffs),
+            coeffs: self.coeffs.iter().zip(other.coeffs.iter()).map(|(&x, &y)| x * y).collect(),
         }
     }
 
-    /// Negates the polynomial in FFT form.
-    pub fn neg(&self) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|&c| -c).collect(),
-        }
-    }
-
-    /// Scales by a real number.
-    pub fn scale(&self, s: f64) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|c| c.scale(s)).collect(),
-        }
-    }
-
-    /// Computes the adjoint (conjugate of coefficients).
-    /// In the ring Z[X]/(X^n + 1), the adjoint of f(x) is f(1/x) * x^n.
     pub fn adj(&self) -> PolyFft {
         PolyFft {
             coeffs: self.coeffs.iter().map(|c| c.conj()).collect(),
-        }
-    }
-
-    /// Computes self * self.adj() = |self|^2 in FFT form.
-    pub fn norm_sq_fft(&self) -> PolyFft {
-        PolyFft {
-            coeffs: self.coeffs.iter().map(|c| Complex::from_real(c.norm_sq())).collect(),
         }
     }
 }
@@ -356,21 +298,129 @@ fn find_primitive_root(n: usize) -> Zq {
         Q - 1
     );
 
-    // 11 is a known primitive root mod 12289
+    // 11 is a known primitive root mod 12289 (order = q-1 = 12288).
+    // Verified: 11^((q-1)/p) != 1 for each prime factor p of 12288 = 2^12 * 3.
+    // Uses pow (not pow_ct) because the exponent (q-1)/n is public.
     let g = Zq::new(11);
     let exp = (Q - 1) as u32 / (n as u32);
     g.pow(exp)
 }
 
-/// Computes the Number Theoretic Transform (NTT) for verification.
-/// This is used to verify FFT computations match exact arithmetic.
-pub fn ntt(a: &[Zq], n: usize) -> Vec<Zq> {
-    let omega = find_primitive_root(2 * n); // 2n-th root for negacyclic
-    let mut result = vec![Zq::ZERO; n];
+/// Reverses the bottom `log_n` bits of `x`.
+#[inline]
+fn bit_reverse(x: usize, log_n: u32) -> usize {
+    x.reverse_bits() >> (usize::BITS - log_n)
+}
 
+/// Computes the negacyclic NTT in O(n log n) via Cooley-Tukey (DIT) butterflies.
+///
+/// Evaluates `a(X)` at `ψ, ψ³, ψ⁵, …, ψ^(2n-1)` where `ψ` is a primitive
+/// 2n-th root of unity in Z_q. This is equivalent to:
+/// 1. Twist: `a'[j] = a[j] * ψ^j`
+/// 2. Standard DIT NTT on `a'` with `ω = ψ²`
+pub fn ntt(a: &[Zq], n: usize) -> Vec<Zq> {
+    let log_n = n.trailing_zeros();
+    debug_assert_eq!(1 << log_n, n, "n must be a power of 2");
+
+    let psi = find_primitive_root(2 * n); // 2n-th root of unity
+    let omega = psi.square();             // n-th root of unity
+
+    // Step 1: Pre-multiply by ψ^j (negacyclic twist)
+    let mut tw = Vec::with_capacity(n);
+    let mut psi_pow = Zq::ONE;
+    for j in 0..n {
+        tw.push(a[j] * psi_pow);
+        psi_pow = psi_pow * psi;
+    }
+
+    // Step 2: Bit-reversal permutation
+    let mut result = vec![Zq::ZERO; n];
+    for i in 0..n {
+        result[bit_reverse(i, log_n)] = tw[i];
+    }
+
+    // Step 3: Cooley-Tukey DIT butterflies
+    let mut len = 1;
+    while len < n {
+        let step = omega.pow((n / (2 * len)) as u32);
+        let mut k = 0;
+        while k < n {
+            let mut w = Zq::ONE;
+            for j in 0..len {
+                let u = result[k + j];
+                let t = w * result[k + j + len];
+                result[k + j] = u + t;
+                result[k + j + len] = u - t;
+                w = w * step;
+            }
+            k += 2 * len;
+        }
+        len <<= 1;
+    }
+
+    result
+}
+
+/// Computes the inverse negacyclic NTT in O(n log n) via Gentleman-Sande (DIF) butterflies.
+///
+/// Recovers coefficients from NTT-domain values:
+/// 1. Gentleman-Sande DIF butterflies with `ω⁻¹ = ψ⁻²`
+/// 2. Bit-reversal permutation
+/// 3. Un-twist: `a[j] *= ψ⁻ʲ · n⁻¹`
+pub fn intt(a: &[Zq], n: usize) -> Vec<Zq> {
+    let log_n = n.trailing_zeros();
+    debug_assert_eq!(1 << log_n, n, "n must be a power of 2");
+
+    let psi = find_primitive_root(2 * n);
+    let omega_inv = psi.square().inverse(); // ω⁻¹
+    let psi_inv = psi.inverse();
+    let n_inv = Zq::new(n as i32).inverse();
+
+    let mut result = a.to_vec();
+
+    // Step 1: Gentleman-Sande DIF butterflies
+    let mut len = n / 2;
+    while len >= 1 {
+        let step = omega_inv.pow((n / (2 * len)) as u32);
+        let mut k = 0;
+        while k < n {
+            let mut w = Zq::ONE;
+            for j in 0..len {
+                let u = result[k + j];
+                let t = result[k + j + len];
+                result[k + j] = u + t;
+                result[k + j + len] = (u - t) * w;
+                w = w * step;
+            }
+            k += 2 * len;
+        }
+        len >>= 1;
+    }
+
+    // Step 2: Bit-reversal permutation
+    let mut permuted = vec![Zq::ZERO; n];
+    for i in 0..n {
+        permuted[bit_reverse(i, log_n)] = result[i];
+    }
+
+    // Step 3: Un-twist and divide by n: a[j] *= ψ⁻ʲ · n⁻¹
+    let mut psi_inv_pow = Zq::ONE;
+    for j in 0..n {
+        permuted[j] = permuted[j] * psi_inv_pow * n_inv;
+        psi_inv_pow = psi_inv_pow * psi_inv;
+    }
+
+    permuted
+}
+
+/// O(n²) naive negacyclic NTT, retained for comparison testing.
+#[cfg(test)]
+fn ntt_naive(a: &[Zq], n: usize) -> Vec<Zq> {
+    let omega = find_primitive_root(2 * n);
+    let mut result = vec![Zq::ZERO; n];
     for i in 0..n {
         let mut sum = Zq::ZERO;
-        let omega_i = omega.pow((2 * i + 1) as u32); // Odd powers for negacyclic
+        let omega_i = omega.pow((2 * i + 1) as u32);
         let mut omega_ij = Zq::ONE;
         for j in 0..n {
             sum += a[j] * omega_ij;
@@ -378,33 +428,24 @@ pub fn ntt(a: &[Zq], n: usize) -> Vec<Zq> {
         }
         result[i] = sum;
     }
-
     result
 }
 
-/// Computes the inverse NTT.
-///
-/// For forward NTT: B[k] = sum_j A[j] * omega^((2k+1)*j)
-/// The inverse is:  A[j] = (1/n) * sum_k B[k] * omega^(-(2k+1)*j)
-///
-/// Note: The exponent is -(2k+1)*j where k is the summation index.
-pub fn intt(a: &[Zq], n: usize) -> Vec<Zq> {
+/// O(n²) naive inverse negacyclic NTT, retained for comparison testing.
+#[cfg(test)]
+fn intt_naive(a: &[Zq], n: usize) -> Vec<Zq> {
     let omega = find_primitive_root(2 * n);
     let omega_inv = omega.inverse();
     let n_inv = Zq::new(n as i32).inverse();
-
     let mut result = vec![Zq::ZERO; n];
-
     for i in 0..n {
         let mut sum = Zq::ZERO;
         for k in 0..n {
-            // Exponent is -(2k+1)*i
             let exp = ((2 * k + 1) * i) as u32;
             sum += a[k] * omega_inv.pow(exp);
         }
         result[i] = sum * n_inv;
     }
-
     result
 }
 
@@ -470,7 +511,7 @@ mod tests {
     fn test_poly_mul_simple() {
         // (1 + x) * (1 - x) = 1 - x^2 in normal polynomial ring
         // But in Z[X]/(X^n + 1), we need to consider wrapping
-        let n = 4;
+        let _n = 4;
         let a = Poly::from_i16(&[1, 1, 0, 0]);
         let b = Poly::from_i16(&[1, -1 + Q as i16, 0, 0]); // 1 - x, using positive representation
         let c = a.mul(&b);
@@ -503,6 +544,33 @@ mod tests {
                 fft_result.coeffs[i], schoolbook_result[i],
                 "Mismatch at index {}: fft={:?}, schoolbook={:?}",
                 i, fft_result.coeffs[i], schoolbook_result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_poly_mul_ntt_matches_schoolbook() {
+        // Test that NTT multiplication matches schoolbook (exact)
+        let a_coeffs: Vec<Zq> = vec![1, 2, 3, 4, 5, 6, 7, 8]
+            .into_iter()
+            .map(Zq::new)
+            .collect();
+        let b_coeffs: Vec<Zq> = vec![8, 7, 6, 5, 4, 3, 2, 1]
+            .into_iter()
+            .map(Zq::new)
+            .collect();
+
+        let a = Poly::from_zq(a_coeffs.clone());
+        let b = Poly::from_zq(b_coeffs.clone());
+
+        let ntt_result = a.mul_ntt(&b);
+        let schoolbook_result = poly_mul_schoolbook(&a_coeffs, &b_coeffs);
+
+        for i in 0..8 {
+            assert_eq!(
+                ntt_result.coeffs[i], schoolbook_result[i],
+                "NTT mismatch at index {}: ntt={:?}, schoolbook={:?}",
+                i, ntt_result.coeffs[i], schoolbook_result[i]
             );
         }
     }
@@ -599,5 +667,54 @@ mod tests {
                 n
             );
         }
+    }
+
+    #[test]
+    fn test_ntt_fast_vs_naive() {
+        // Compare O(n log n) Cooley-Tukey NTT against O(n²) naive at several sizes
+        for &n in &[8, 16, 64, 512] {
+            let a: Vec<Zq> = (0..n).map(|i| Zq::new((i * 37 + 13) as i32 % Q)).collect();
+            let fast = ntt(&a, n);
+            let naive = ntt_naive(&a, n);
+            assert_eq!(fast, naive, "ntt mismatch at n={}", n);
+        }
+    }
+
+    #[test]
+    fn test_intt_fast_vs_naive() {
+        // Compare O(n log n) Gentleman-Sande INTT against O(n²) naive at several sizes
+        for &n in &[8, 16, 64, 512] {
+            let a: Vec<Zq> = (0..n).map(|i| Zq::new((i * 53 + 7) as i32 % Q)).collect();
+            let fast = intt(&a, n);
+            let naive = intt_naive(&a, n);
+            assert_eq!(fast, naive, "intt mismatch at n={}", n);
+        }
+    }
+
+    #[test]
+    fn test_ntt_intt_roundtrip() {
+        // Verify ntt then intt recovers original polynomial
+        for &n in &[8, 16, 64, 512, 1024] {
+            let a: Vec<Zq> = (0..n).map(|i| Zq::new((i * 41 + 3) as i32 % Q)).collect();
+            let transformed = ntt(&a, n);
+            let recovered = intt(&transformed, n);
+            assert_eq!(a, recovered, "roundtrip failed at n={}", n);
+        }
+    }
+
+    #[test]
+    fn test_ntt_mul_matches_schoolbook() {
+        // Verify fast NTT-based multiplication matches schoolbook at n=512
+        let n = 512;
+        let a: Vec<Zq> = (0..n).map(|i| Zq::new((i * 17 + 5) as i32 % Q)).collect();
+        let b: Vec<Zq> = (0..n).map(|i| Zq::new((i * 23 + 11) as i32 % Q)).collect();
+
+        let a_ntt = ntt(&a, n);
+        let b_ntt = ntt(&b, n);
+        let c_ntt: Vec<Zq> = (0..n).map(|i| a_ntt[i] * b_ntt[i]).collect();
+        let ntt_result = intt(&c_ntt, n);
+
+        let schoolbook = poly_mul_schoolbook(&a, &b);
+        assert_eq!(ntt_result, schoolbook, "NTT mul != schoolbook at n=512");
     }
 }

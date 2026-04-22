@@ -7,52 +7,62 @@ use sha3::{Shake256, digest::{ExtendableOutput, Update, XofReader}};
 use crate::field::Zq;
 use crate::params::{Params, Q, NONCE_SIZE};
 
-/// Hashes a message and nonce to a polynomial in Z_q.
+/// Hashes a message and nonce to a polynomial in Z_q (constant-time).
 ///
 /// Uses SHAKE256 to generate a uniformly random polynomial c ∈ Z_q[X]/(X^n + 1).
 /// The output polynomial has coefficients in [0, q-1].
+///
+/// Implements constant-time rejection sampling matching the Falcon reference
+/// `hash_to_point_ct` to prevent timing side-channel leakage:
+/// - Input: SHAKE256(nonce || message)
+/// - Reads 2 bytes big-endian as a 16-bit value w
+/// - Accepts if w < 5*q = 61445, rejects otherwise
+/// - Reduces w mod q to get the coefficient
+/// - All samples are processed identically regardless of acceptance
 pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     let n = params.n;
     let mut result = vec![Zq::ZERO; n];
 
-    // Create SHAKE256 instance
     let mut hasher = Shake256::default();
     hasher.update(nonce);
     hasher.update(message);
-
     let mut reader = hasher.finalize_xof();
 
-    // Generate n coefficients using rejection sampling
-    let mut buf = [0u8; 2];
-    let mut i = 0;
+    // Oversample: read enough 2-byte pairs to guarantee >= n accepted values.
+    // Acceptance rate is 61445/65536 ≈ 93.8%. For n=512, 840 samples gives
+    // a negligible probability of insufficient accepted values.
+    let num_samples = n + n / 4 + 200;
+    let mut buf = vec![0u8; num_samples * 2];
+    reader.read(&mut buf);
 
-    while i < n {
-        reader.read(&mut buf);
-
-        // Interpret as little-endian 16-bit value and mask to 14 bits
-        let val = u16::from_le_bytes(buf) & 0x3FFF;
-
-        // Reject if >= q
-        if val < Q as u16 {
-            result[i] = Zq::from_i16_unchecked(val as i16);
-            i += 1;
-        }
+    // Pass 1: evaluate all samples, store value + validity
+    let mut samples = Vec::with_capacity(num_samples);
+    for k in 0..num_samples {
+        let w = ((buf[2 * k] as u32) << 8) | (buf[2 * k + 1] as u32);
+        let valid = w < 61445;
+        let val = (w % (Q as u32)) as i16;
+        samples.push((val, valid));
     }
 
+    // Pass 2: constant-time fill — process every sample, no branching on validity
+    let mut i: usize = 0;
+    for &(val, valid) in &samples {
+        // Constant-time: only write if valid AND we still need values
+        let need = i < n;
+        let accept = valid & need;
+
+        // Branchless conditional write using a mask
+        let mask = -(accept as i16); // -1 (0xFFFF) if accept, 0 if not
+        let idx = if i < n { i } else { n - 1 };
+        let old = result[idx].value();
+        result[idx] = Zq::from_i16_unchecked((old & !mask) | (val & mask));
+
+        i += accept as usize;
+    }
+
+    assert!(i >= n, "hash_to_point: insufficient accepted samples");
+
     result
-}
-
-/// Computes a domain-separated hash for key generation.
-pub fn hash_for_keygen(seed: &[u8], counter: u32, output_len: usize) -> Vec<u8> {
-    let mut hasher = Shake256::default();
-    hasher.update(b"FALCON-KEYGEN");
-    hasher.update(seed);
-    hasher.update(&counter.to_le_bytes());
-
-    let mut reader = hasher.finalize_xof();
-    let mut output = vec![0u8; output_len];
-    reader.read(&mut output);
-    output
 }
 
 /// Generates a random nonce for signing.
@@ -60,56 +70,6 @@ pub fn generate_nonce<R: rand::RngCore>(rng: &mut R) -> [u8; NONCE_SIZE] {
     let mut nonce = [0u8; NONCE_SIZE];
     rng.fill_bytes(&mut nonce);
     nonce
-}
-
-/// Computes the hash used in signature verification.
-///
-/// This takes the public key hash, nonce, and message and produces
-/// the challenge polynomial c.
-pub fn hash_challenge(
-    pk_hash: &[u8],
-    nonce: &[u8],
-    message: &[u8],
-    params: &Params,
-) -> Vec<Zq> {
-    let mut hasher = Shake256::default();
-    hasher.update(pk_hash);
-    hasher.update(nonce);
-    hasher.update(message);
-
-    let mut reader = hasher.finalize_xof();
-
-    let n = params.n;
-    let mut result = vec![Zq::ZERO; n];
-    let mut buf = [0u8; 2];
-    let mut i = 0;
-
-    while i < n {
-        reader.read(&mut buf);
-        let val = u16::from_le_bytes(buf) & 0x3FFF;
-
-        if val < Q as u16 {
-            result[i] = Zq::from_i16_unchecked(val as i16);
-            i += 1;
-        }
-    }
-
-    result
-}
-
-/// Hashes a public key to a fixed-size digest.
-pub fn hash_public_key(h: &[i16]) -> Vec<u8> {
-    let mut hasher = Shake256::default();
-    hasher.update(b"FALCON-PK");
-
-    for &coeff in h {
-        hasher.update(&coeff.to_le_bytes());
-    }
-
-    let mut reader = hasher.finalize_xof();
-    let mut output = vec![0u8; 32];
-    reader.read(&mut output);
-    output
 }
 
 #[cfg(test)]
@@ -151,16 +111,6 @@ mod tests {
         for coeff in &c {
             assert!(coeff.value() >= 0 && coeff.value() < Q as i16);
         }
-    }
-
-    #[test]
-    fn test_hash_public_key() {
-        let h: Vec<i16> = (0..512).map(|i| (i * 7) as i16 % Q as i16).collect();
-        let hash1 = hash_public_key(&h);
-        let hash2 = hash_public_key(&h);
-
-        assert_eq!(hash1.len(), 32);
-        assert_eq!(hash1, hash2);
     }
 
     #[test]

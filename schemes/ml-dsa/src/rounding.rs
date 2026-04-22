@@ -13,6 +13,43 @@ use crate::poly::Poly;
 use crate::polyvec::PolyVec;
 use crate::reduce::freeze;
 
+/// Barrett constant for alpha = 190464 (ML-DSA-44): floor(2^32 / 190464)
+const BARRETT_MU_ALPHA_44: u64 = (1u64 << 32) / 190464;
+
+/// Barrett constant for alpha = 523776 (ML-DSA-65/87): floor(2^32 / 523776)
+const BARRETT_MU_ALPHA_65: u64 = (1u64 << 32) / 523776;
+
+/// Constant-time modulo by alpha using Barrett reduction.
+/// Input: r in [0, Q), alpha in {190464, 523776}
+#[inline]
+fn ct_mod_alpha(r: i32, alpha: i32, barrett_mu: u64) -> i32 {
+    let q = (r as u64).wrapping_mul(barrett_mu) >> 32;
+    let mut rem = r - (q as i32) * alpha;
+    // Conditional subtract if rem >= alpha
+    let mask = ((alpha - 1 - rem) >> 31) & 1;
+    rem -= alpha * mask;
+    rem
+}
+
+/// Constant-time division by alpha using Barrett.
+#[inline]
+fn ct_div_alpha(r: i32, alpha: i32, barrett_mu: u64) -> i32 {
+    let mut q = ((r as u64).wrapping_mul(barrett_mu) >> 32) as i32;
+    // Barrett can underestimate by 1; correct if remainder >= alpha
+    let rem = r - q * alpha;
+    let mask = ((alpha - 1 - rem) >> 31) & 1; // 1 if rem >= alpha
+    q += mask;
+    q
+}
+
+/// Constant-time equality check. Returns -1 (all bits set) if a == b, 0 otherwise.
+#[inline]
+fn ct_eq(a: i32, b: i32) -> i32 {
+    let diff = (a ^ b) as u32;
+    let is_nonzero = (diff | diff.wrapping_neg()) >> 31; // 1 if diff != 0
+    (is_nonzero as i32) - 1 // -1 if equal (is_nonzero=0), 0 if not (is_nonzero=1)
+}
+
 /// Power2Round: Decomposes r into (r1, r0) where r = r1 * 2^d + r0.
 ///
 /// r0 is in [-2^(d-1), 2^(d-1)].
@@ -78,32 +115,41 @@ pub fn power2round_vec(t: &PolyVec) -> (PolyVec, PolyVec) {
 /// - r1 is the "high" part
 /// - r0 is the "low" part in (-γ2, γ2]
 ///
+/// Constant-time: uses Barrett reduction instead of `%` and `/` operators,
+/// and arithmetic masks instead of branches on secret-dependent data.
+///
 /// FIPS 204 Algorithm 31
 pub fn decompose(r: i32, gamma2: i32) -> (i32, i32) {
     let r_plus = freeze(r); // r in [0, Q)
     let alpha = 2 * gamma2;
 
-    // r0 = r mod± α (centered modular reduction to (-γ2, γ2])
-    // First compute r mod α in [0, α)
-    let r_mod_alpha = r_plus % alpha;
-
-    // Center to (-γ2, γ2]: if r_mod_alpha > γ2, subtract α
-    let r0 = if r_mod_alpha > gamma2 {
-        r_mod_alpha - alpha
+    // Select Barrett constant based on alpha (public parameter, not secret)
+    let barrett_mu = if alpha == 190464 {
+        BARRETT_MU_ALPHA_44
     } else {
-        r_mod_alpha
+        BARRETT_MU_ALPHA_65
     };
 
-    // Handle special case: r_plus - r0 = q - 1
-    // This happens when r_plus is near q-1 and r0 would make r1 = (q-1)/α
-    if r_plus - r0 == Q - 1 {
-        return (0, r0 - 1);
-    }
+    // r_mod_alpha = r_plus % alpha (constant-time Barrett)
+    let r_mod_alpha = ct_mod_alpha(r_plus, alpha, barrett_mu);
 
-    // r1 = (r_plus - r0) / α
-    let r1 = (r_plus - r0) / alpha;
+    // Center to (-γ2, γ2]: if r_mod_alpha > γ2, subtract α (constant-time)
+    let gt_mask = ((gamma2 - r_mod_alpha) >> 31) & 1; // 1 if r_mod_alpha > gamma2
+    let r0 = r_mod_alpha - alpha * gt_mask;
 
-    (r1, r0)
+    // Compute r1 = (r_plus - r0) / alpha (constant-time Barrett)
+    let diff = r_plus - r0;
+    let r1_normal = ct_div_alpha(diff, alpha, barrett_mu);
+
+    // Handle special case: if diff == Q-1, return (0, r0-1)
+    // special is -1 (all bits set) if diff == Q-1, 0 otherwise
+    let special = ct_eq(diff, Q - 1);
+    let not_special = !special;
+    let r1 = r1_normal & not_special; // 0 when special, r1_normal when not
+    // r0 + special gives r0 - 1 when special (special = -1), r0 when not (special = 0)
+    let r0_final = r0 + special;
+
+    (r1, r0_final)
 }
 
 /// HighBits: Returns the high-order representative r1.
@@ -453,5 +499,32 @@ mod tests {
         // Set one coefficient close to bound
         v.polys[0].coeffs[0] = gamma2 - beta + 1; // Just over the bound
         assert!(!check_low_bits(&v, gamma2, beta));
+    }
+
+    #[test]
+    fn test_decompose_ct_exhaustive_44() {
+        let gamma2 = 95232;
+        let alpha = 2 * gamma2;
+        // Test all r in [0, Q) — this takes a few seconds but is feasible
+        for r in 0..Q {
+            let (r1, r0) = decompose(r, gamma2);
+            // Verify reconstruction
+            let reconstructed = freeze(r1 * alpha + r0);
+            assert_eq!(reconstructed, r, "decompose reconstruction failed for r={}", r);
+            // Verify r0 bounds
+            assert!(r0.abs() <= gamma2, "r0={} out of bounds for r={}", r0, r);
+        }
+    }
+
+    #[test]
+    fn test_decompose_ct_exhaustive_65() {
+        let gamma2 = 261888;
+        let alpha = 2 * gamma2;
+        for r in 0..Q {
+            let (r1, r0) = decompose(r, gamma2);
+            let reconstructed = freeze(r1 * alpha + r0);
+            assert_eq!(reconstructed, r, "decompose reconstruction failed for r={}", r);
+            assert!(r0.abs() <= gamma2, "r0={} out of bounds for r={}", r0, r);
+        }
     }
 }
