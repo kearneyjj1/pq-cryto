@@ -7,7 +7,7 @@
 //! The key insight is that in the FFT domain, the n-dimensional lattice
 //! sampling problem decomposes into n independent 2×2 problems.
 
-use crate::fft::{fft, ifft, Complex};
+use crate::fft::{fft, ifft, merge_fft, split_fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::gaussian::SamplerZ;
 use rand::RngCore;
@@ -39,11 +39,9 @@ impl<'a> FfSampler<'a> {
 
     /// Samples a lattice point close to the target (c, 0).
     ///
-    /// Steps:
-    /// 1. Compute Babai target t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c)
-    /// 2. IFFT to coefficient domain
-    /// 3. Sample each coefficient from a discrete Gaussian at the target
-    /// 4. FFT back to frequency domain
+    /// Computes the Babai target t = B^(-1) * (c, 0) = (1/q) * (-F*c, f*c)
+    /// in the FFT domain, then uses recursive ffSampling via the LDL* tree
+    /// to produce a short lattice vector.
     ///
     /// Returns (z0_fft, z1_fft) in FFT form.
     pub fn sample_signature<R: RngCore>(
@@ -55,37 +53,96 @@ impl<'a> FfSampler<'a> {
         let q = 12289.0;
 
         // Compute target in FFT domain: t0 = -F*c/q, t1 = f*c/q
-        let mut t0_fft: Vec<Complex> = Vec::with_capacity(n);
-        let mut t1_fft: Vec<Complex> = Vec::with_capacity(n);
+        let mut t0: Vec<Complex> = Vec::with_capacity(n);
+        let mut t1: Vec<Complex> = Vec::with_capacity(n);
         for i in 0..n {
             let c_i = c_fft[i];
-            t0_fft.push((-self.gs.big_f_fft[i] * c_i).scale(1.0 / q));
-            t1_fft.push((self.gs.f_fft[i] * c_i).scale(1.0 / q));
+            t0.push((-self.gs.big_f_fft[i] * c_i).scale(1.0 / q));
+            t1.push((self.gs.f_fft[i] * c_i).scale(1.0 / q));
         }
 
-        // Convert to coefficient domain for integer sampling
-        ifft(&mut t0_fft);
-        ifft(&mut t1_fft);
+        // Recursive ffSampling using the LDL* tree
+        self.ff_sample_recursive(rng, &t0, &t1, 0, 0)
+    }
 
-        // Effective noise sigma: scale global sigma by average GS norm
-        let avg_sigma_fg: f64 = self.gs.sigma_fg.iter().sum::<f64>() / n as f64;
-        let noise_sigma = (self.sigma_sign / avg_sigma_fg).max(0.5).min(self.sigma_sign);
+    /// Recursive ffSampling (FIPS 206 Algorithm 11).
+    ///
+    /// The LDL* tree stores at each node:
+    /// - sigma[i] = sqrt(d0[i]) where d0 is from the LDL* decomposition G = L*D*L*
+    /// - gs_coeffs[i] = l10[i], the lower-triangular coefficient
+    ///
+    /// At leaves (n=1):
+    /// - sigma = [sqrt(d0), sqrt(d1)]
+    /// - gs_coeffs = [l10]
+    /// - Sampling width = sigma_sign * sigma[i]
+    ///
+    /// At internal nodes (n>1):
+    /// - sigma[i] = sqrt(d0[i]) per FFT position
+    /// - gs_coeffs[i] = l10[i] per FFT position
+    fn ff_sample_recursive<R: RngCore>(
+        &self,
+        rng: &mut R,
+        t0: &[Complex],
+        t1: &[Complex],
+        level: usize,
+        pos: usize,
+    ) -> (Vec<Complex>, Vec<Complex>) {
+        let n = t0.len();
+        let node = self.gs.tree.get_node(level, pos);
 
-        // Sample z0, z1 as integer polynomials close to the target
-        let mut z0_fft: Vec<Complex> = t0_fft
-            .iter()
-            .map(|p| Complex::from_real(self.sampler_z.sample(rng, p.re, noise_sigma) as f64))
-            .collect();
-        let mut z1_fft: Vec<Complex> = t1_fft
-            .iter()
-            .map(|p| Complex::from_real(self.sampler_z.sample(rng, p.re, noise_sigma) as f64))
-            .collect();
+        if n == 1 {
+            // Base case: scalar LDL* sampling
+            // sigma[0] = sqrt(d0), sigma[1] = sqrt(d1)
+            // gs_coeffs[0] = l10 (lower-triangular coefficient)
+            //
+            // The tree stores sqrt(d_i) from the LDL* decomposition of the
+            // Gram matrix G = B*B*. The sampling width at each leaf is
+            // sigma_sign * sqrt(d_i / q) to account for the Gram matrix scaling.
+            let q = 12289.0;
+            let sigma_0 = self.sigma_sign * (node.sigma[0] / q.sqrt());
+            let sigma_1 = self.sigma_sign * (node.sigma[1] / q.sqrt());
+            let l10 = node.l10[0];
 
-        // Convert back to FFT form
-        fft(&mut z0_fft);
-        fft(&mut z1_fft);
+            // Sample z1 first (second basis vector direction)
+            let z1_val = self.sampler_z.sample(rng, t1[0].re, sigma_1) as f64;
 
-        (z0_fft, z1_fft)
+            // Adjust t0: t0_adj = t0 + l10 * (t1 - z1)
+            let t0_adj = t0[0].re + l10.re * (t1[0].re - z1_val);
+
+            // Sample z0 from adjusted target
+            let z0_val = self.sampler_z.sample(rng, t0_adj, sigma_0) as f64;
+
+            return (
+                vec![Complex::from_real(z0_val)],
+                vec![Complex::from_real(z1_val)],
+            );
+        }
+
+        // Recursive case: split, recurse, adjust, recurse, merge
+
+        // Split t1 and recurse on RIGHT child (d1 subtree)
+        let (t1_lo, t1_hi) = split_fft(t1);
+        let (z1_lo, z1_hi) = self.ff_sample_recursive(
+            rng, &t1_lo, &t1_hi, level + 1, 2 * pos + 1
+        );
+        let z1_full = merge_fft(&z1_lo, &z1_hi);
+
+        // Adjust t0 using this node's l10 coefficients:
+        // t0_adj[i] = t0[i] + l10[i] * (t1[i] - z1[i])
+        let mut t0_adj = Vec::with_capacity(n);
+        for i in 0..n {
+            let diff = t1[i] - z1_full[i];
+            t0_adj.push(t0[i] + node.l10[i] * diff);
+        }
+
+        // Split adjusted t0 and recurse on LEFT child (d0 subtree)
+        let (t0_lo, t0_hi) = split_fft(&t0_adj);
+        let (z0_lo, z0_hi) = self.ff_sample_recursive(
+            rng, &t0_lo, &t0_hi, level + 1, 2 * pos
+        );
+        let z0_full = merge_fft(&z0_lo, &z0_hi);
+
+        (z0_full, z1_full)
     }
 }
 

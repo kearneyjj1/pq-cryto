@@ -118,6 +118,12 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
             .fold(0i64, |acc, x| acc.saturating_add(x));
         let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
 
+        #[cfg(test)]
+        if _attempt < 3 {
+            eprintln!("sign attempt {}: s1_norm_sq={}, s2_norm_sq={}, total={}, bound={}",
+                _attempt, s1_norm_sq, s2_norm_sq, total_norm_sq, bound_sq);
+        }
+
         if (total_norm_sq as f64) <= bound_sq {
             return Ok(Signature { nonce, s2 });
         }
