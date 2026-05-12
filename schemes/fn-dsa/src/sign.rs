@@ -4,6 +4,7 @@
 //! which uses Fast Fourier Sampling to produce compact signatures.
 
 use rand::RngCore;
+use zeroize::Zeroize;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
 use crate::hash::{generate_nonce, hash_to_point};
@@ -67,71 +68,85 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
     fft(&mut big_f_fft);
     fft(&mut big_g_fft);
 
-    for _attempt in 0..MAX_SIGN_ATTEMPTS {
-        // Generate a fresh nonce
-        let nonce = generate_nonce(rng);
+    let result = (|| {
+        for _attempt in 0..MAX_SIGN_ATTEMPTS {
+            // Generate a fresh nonce
+            let nonce = generate_nonce(rng);
 
-        // Hash the message to get c
-        let c = hash_to_point(message, &nonce, &sk.params);
+            // Hash the message to get c
+            let c = hash_to_point(message, &nonce, &sk.params);
 
-        // Convert c to FFT form for operations
-        let mut c_fft: Vec<Complex> = c.iter().map(|zq| Complex::from_real(zq.value() as f64)).collect();
-        fft(&mut c_fft);
+            // Convert c to FFT form for operations
+            let mut c_fft: Vec<Complex> = c.iter().map(|zq| Complex::from_real(zq.value() as f64)).collect();
+            fft(&mut c_fft);
 
-        // Use the FFT sampler to sample (z0, z1) close to the target
-        let (z0_fft, z1_fft) = ff_sampler.sample_signature(rng, &c_fft);
+            // Use the FFT sampler to sample (z0, z1) close to the target
+            let (mut z0_fft, mut z1_fft) = ff_sampler.sample_signature(rng, &c_fft);
 
-        // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
-        let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
-        for i in 0..n {
-            s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
+            // Compute s2 = z0*f + z1*F (in FFT form, then convert back)
+            let mut s2_fft: Vec<Complex> = Vec::with_capacity(n);
+            for i in 0..n {
+                s2_fft.push(z0_fft[i] * f_fft[i] + z1_fft[i] * big_f_fft[i]);
+            }
+            z0_fft.zeroize();
+            z1_fft.zeroize();
+            c_fft.zeroize();
+
+            // Convert s2 back to coefficient form
+            ifft(&mut s2_fft);
+            let s2: Vec<i16> = s2_fft.iter()
+                .map(|c| {
+                    let val = c.re.round() as i32;
+                    // Reduce modulo q and center
+                    let reduced = ((val % Q) + Q) % Q;
+                    if reduced > Q / 2 {
+                        (reduced - Q) as i16
+                    } else {
+                        reduced as i16
+                    }
+                })
+                .collect();
+            s2_fft.zeroize();
+
+            // Compute s1 = c - s2*h using exact NTT-based multiplication so the
+            // sign-side norm check matches the verifier (which also uses mul_ntt
+            // at verify.rs:38). Using the FP-FFT mul here introduces ~ULP rounding
+            // per coefficient that, scaled by the polynomial product, can produce
+            // false rejections when the true norm is just under the bound.
+            use crate::poly::Poly;
+            let c_poly = Poly::from_zq(c.clone());
+            let s2_poly = Poly::from_i16(&s2);
+            let h_poly = Poly::from_i16(&sk.h);
+            let s2h = s2_poly.mul_ntt(&h_poly);
+            let s1_poly = c_poly.sub(&s2h);
+
+            // Check the norm (using saturating arithmetic for safety)
+            let s1_norm_sq = s1_poly.norm_sq();
+            let s2_norm_sq: i64 = s2.iter()
+                .map(|&x| (x as i64) * (x as i64))
+                .fold(0i64, |acc, x| acc.saturating_add(x));
+            let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
+
+            if (total_norm_sq as f64) <= bound_sq {
+                return Ok(Signature { nonce, s2 });
+            }
         }
 
-        // Convert s2 back to coefficient form
-        ifft(&mut s2_fft);
-        let s2: Vec<i16> = s2_fft.iter()
-            .map(|c| {
-                let val = c.re.round() as i32;
-                // Reduce modulo q and center
-                let reduced = ((val % Q) + Q) % Q;
-                if reduced > Q / 2 {
-                    (reduced - Q) as i16
-                } else {
-                    reduced as i16
-                }
-            })
-            .collect();
+        Err(FnDsaError::SigningFailed {
+            attempts: MAX_SIGN_ATTEMPTS,
+        })
+    })();
 
-        // Compute s1 = c - s2*h using polynomial arithmetic (same as verification)
-        // This ensures the norm check uses the same computation as verification
-        use crate::poly::Poly;
-        let c_poly = Poly::from_zq(c.clone());
-        let s2_poly = Poly::from_i16(&s2);
-        let h_poly = Poly::from_i16(&sk.h);
-        let s2h = s2_poly.mul(&h_poly);
-        let s1_poly = c_poly.sub(&s2h);
+    // Scrub the FFT-domain copies of the secret key polynomials before
+    // returning. Without this the secret-key f/g/F/G FFTs would sit on the
+    // heap for the allocator's discretion. (sk.f/g/F/G themselves remain
+    // owned by the caller and are zeroized in SecretKey::Drop.)
+    f_fft.zeroize();
+    g_fft.zeroize();
+    big_f_fft.zeroize();
+    big_g_fft.zeroize();
 
-        // Check the norm (using saturating arithmetic for safety)
-        let s1_norm_sq = s1_poly.norm_sq();
-        let s2_norm_sq: i64 = s2.iter()
-            .map(|&x| (x as i64) * (x as i64))
-            .fold(0i64, |acc, x| acc.saturating_add(x));
-        let total_norm_sq = s1_norm_sq.saturating_add(s2_norm_sq);
-
-        #[cfg(test)]
-        if _attempt < 3 {
-            eprintln!("sign attempt {}: s1_norm_sq={}, s2_norm_sq={}, total={}, bound={}",
-                _attempt, s1_norm_sq, s2_norm_sq, total_norm_sq, bound_sq);
-        }
-
-        if (total_norm_sq as f64) <= bound_sq {
-            return Ok(Signature { nonce, s2 });
-        }
-    }
-
-    Err(FnDsaError::SigningFailed {
-        attempts: MAX_SIGN_ATTEMPTS,
-    })
+    result
 }
 
 /// Signs a message using direct s2 sampling with rejection (for educational demo).
@@ -307,37 +322,19 @@ mod tests {
         }
     }
 
-    // Full integration test with FALCON-512 (requires working NTRUSolve for large n)
+    // Full integration test with FALCON-512.
     #[test]
-    #[ignore]
     fn test_sign_falcon_512() {
         use crate::keygen::keygen_512;
 
-        // Use a seed that is known to find valid NTRU pairs
         let mut rng = StdRng::seed_from_u64(42);
+        let keypair = keygen_512(&mut rng).expect("FALCON-512 keygen must succeed");
 
-        // Generate key pair
-        let keypair = match keygen_512(&mut rng) {
-            Ok(kp) => kp,
-            Err(e) => {
-                println!("Keygen failed (expected for incomplete impl): {}", e);
-                return;
-            }
-        };
-
-        // Sign a message
         let message = b"Hello, FALCON!";
-        let sig = sign(&mut rng, &keypair.sk, message);
+        let sig = sign(&mut rng, &keypair.sk, message)
+            .expect("FALCON-512 signing must succeed");
 
-        match sig {
-            Ok(s) => {
-                assert_eq!(s.s2.len(), 512);
-                assert!(s.norm_sq() < keypair.sk.params.sig_bound_sq as i64);
-                println!("FALCON-512 signing succeeded! Signature norm^2: {}", s.norm_sq());
-            }
-            Err(e) => {
-                println!("Signing failed: {}", e);
-            }
-        }
+        assert_eq!(sig.s2.len(), 512);
+        assert!((sig.norm_sq() as f64) < keypair.sk.params.sig_bound_sq);
     }
 }

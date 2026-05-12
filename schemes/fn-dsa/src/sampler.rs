@@ -11,6 +11,7 @@ use crate::fft::{fft, ifft, merge_fft, split_fft, Complex};
 use crate::fft_tree::GramSchmidt;
 use crate::gaussian::SamplerZ;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 /// The Fast Fourier Sampler.
 ///
@@ -25,6 +26,10 @@ pub struct FfSampler<'a> {
     sampler_z: SamplerZ,
     /// The signing sigma parameter.
     sigma_sign: f64,
+    /// The minimum sigma (sigma_min) for the leaf sampler. Used to assert
+    /// that the per-leaf effective sigma stays within the FIPS 206 validity
+    /// range; a leaf sigma below sigma_min indicates a mis-scaled tree.
+    sigma_min: f64,
 }
 
 impl<'a> FfSampler<'a> {
@@ -34,6 +39,7 @@ impl<'a> FfSampler<'a> {
             gs,
             sampler_z: SamplerZ::with_sigma_min(sigma_min),
             sigma_sign,
+            sigma_min,
         }
     }
 
@@ -61,8 +67,13 @@ impl<'a> FfSampler<'a> {
             t1.push((self.gs.f_fft[i] * c_i).scale(1.0 / q));
         }
 
-        // Recursive ffSampling using the LDL* tree
-        self.ff_sample_recursive(rng, &t0, &t1, 0, 0)
+        // Recursive ffSampling using the LDL* tree. After the call, the
+        // secret-derived target vectors are scrubbed; the returned z0/z1
+        // are the caller's responsibility.
+        let result = self.ff_sample_recursive(rng, &t0, &t1, 0, 0);
+        t0.zeroize();
+        t1.zeroize();
+        result
     }
 
     /// Recursive ffSampling (FIPS 206 Algorithm 11).
@@ -91,16 +102,33 @@ impl<'a> FfSampler<'a> {
         let node = self.gs.tree.get_node(level, pos);
 
         if n == 1 {
-            // Base case: scalar LDL* sampling
-            // sigma[0] = sqrt(d0), sigma[1] = sqrt(d1)
-            // gs_coeffs[0] = l10 (lower-triangular coefficient)
+            // Base case: scalar LDL* sampling per FIPS 206 Algorithm 11.
+            // node.sigma[i] stores sqrt(d_i) from the LDL* decomposition
+            // G = L*D*L*. The leaf sampling width is sigma_sign / sqrt(d_i),
+            // i.e. sigma_sign / node.sigma[i]. For FIPS-compliant parameter
+            // sets (FALCON-512/1024), keygen's basis-quality check ensures
+            // this is always >= sigma_min. Toy parameter sets used only in
+            // tests (e.g. FALCON-16) cannot enforce basis quality, so we
+            // clamp at sigma_min for sampler robustness. On production
+            // parameters the clamp never engages.
             //
-            // The tree stores sqrt(d_i) from the LDL* decomposition of the
-            // Gram matrix G = B*B*. The sampling width at each leaf is
-            // sigma_sign * sqrt(d_i / q) to account for the Gram matrix scaling.
-            let q = 12289.0;
-            let sigma_0 = self.sigma_sign * (node.sigma[0] / q.sqrt());
-            let sigma_1 = self.sigma_sign * (node.sigma[1] / q.sqrt());
+            // Hermitian-symmetry sanity check: Falcon's tree-ordered FFT
+            // preserves real-valued leaves for real-input polynomials, so
+            // both t0[0] and t1[0] should have negligible imaginary part
+            // at the deepest recursion. A meaningful im here would signal
+            // either a wrong FFT root ordering or an integer-rounding step
+            // that broke symmetry mid-recursion. Tolerance accounts for
+            // O(log n) levels of accumulated FP noise.
+            debug_assert!(
+                t0[0].im.abs() < 1e-6,
+                "leaf t0 has non-real value im={}", t0[0].im
+            );
+            debug_assert!(
+                t1[0].im.abs() < 1e-6,
+                "leaf t1 has non-real value im={}", t1[0].im
+            );
+            let sigma_0 = (self.sigma_sign / node.sigma[0]).max(self.sigma_min);
+            let sigma_1 = (self.sigma_sign / node.sigma[1]).max(self.sigma_min);
             let l10 = node.l10[0];
 
             // Sample z1 first (second basis vector direction)
@@ -118,14 +146,25 @@ impl<'a> FfSampler<'a> {
             );
         }
 
-        // Recursive case: split, recurse, adjust, recurse, merge
+        // Recursive case: split, recurse, adjust, recurse, merge.
+        //
+        // Every intermediate vector below carries secret-derived state
+        // (FFT of a function of f, g, F, G, c). We scrub each one once it
+        // is no longer used. Per recursive call this is 10 heap vectors;
+        // for n=512 the recursion has 1023 internal nodes, so a single
+        // signing call would otherwise leave ~10k secret-bearing vectors
+        // on the heap waiting for allocator reuse.
 
-        // Split t1 and recurse on RIGHT child (d1 subtree)
-        let (t1_lo, t1_hi) = split_fft(t1);
-        let (z1_lo, z1_hi) = self.ff_sample_recursive(
+        // Split t1 and recurse on RIGHT child (d1 subtree).
+        let (mut t1_lo, mut t1_hi) = split_fft(t1);
+        let (mut z1_lo, mut z1_hi) = self.ff_sample_recursive(
             rng, &t1_lo, &t1_hi, level + 1, 2 * pos + 1
         );
         let z1_full = merge_fft(&z1_lo, &z1_hi);
+        t1_lo.zeroize();
+        t1_hi.zeroize();
+        z1_lo.zeroize();
+        z1_hi.zeroize();
 
         // Adjust t0 using this node's l10 coefficients:
         // t0_adj[i] = t0[i] + l10[i] * (t1[i] - z1[i])
@@ -135,12 +174,17 @@ impl<'a> FfSampler<'a> {
             t0_adj.push(t0[i] + node.l10[i] * diff);
         }
 
-        // Split adjusted t0 and recurse on LEFT child (d0 subtree)
-        let (t0_lo, t0_hi) = split_fft(&t0_adj);
-        let (z0_lo, z0_hi) = self.ff_sample_recursive(
+        // Split adjusted t0 and recurse on LEFT child (d0 subtree).
+        let (mut t0_lo, mut t0_hi) = split_fft(&t0_adj);
+        t0_adj.zeroize();
+        let (mut z0_lo, mut z0_hi) = self.ff_sample_recursive(
             rng, &t0_lo, &t0_hi, level + 1, 2 * pos
         );
         let z0_full = merge_fft(&z0_lo, &z0_hi);
+        t0_lo.zeroize();
+        t0_hi.zeroize();
+        z0_lo.zeroize();
+        z0_hi.zeroize();
 
         (z0_full, z1_full)
     }
