@@ -5,8 +5,36 @@
 use crate::error::{FnDsaError, Result};
 use crate::hash::hash_to_point;
 use crate::keygen::PublicKey;
+use crate::params::Q;
 use crate::poly::Poly;
 use crate::sign::Signature;
+
+/// Validates that a public key has the right shape for its parameter set.
+///
+/// Verifies `pk.h.len() == params.n` and that every coefficient of `h`
+/// is a valid representative of `Z_q` (in `[0, q)`). Without these checks
+/// a directly-constructed `PublicKey` with mismatched length or out-of-range
+/// coefficients would panic deep inside the NTT or compute a misleading
+/// verification result.
+fn validate_public_key(pk: &PublicKey) -> Result<()> {
+    if pk.h.len() != pk.params.n {
+        return Err(FnDsaError::InvalidInput {
+            field: "public_key.h",
+            reason: "length does not match parameter set n",
+        });
+    }
+    // h coefficients are stored as i16 representatives of Z_q. The encoding
+    // uses unsigned-positive [0, q), so values must satisfy 0 <= h[i] < q.
+    for &h_i in &pk.h {
+        if !(0..Q as i16).contains(&h_i) {
+            return Err(FnDsaError::InvalidInput {
+                field: "public_key.h",
+                reason: "coefficient outside [0, q)",
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Verifies a FALCON signature.
 ///
@@ -19,6 +47,11 @@ use crate::sign::Signature;
 pub fn verify(pk: &PublicKey, message: &[u8], sig: &Signature) -> Result<()> {
     let n = pk.params.n;
     let bound_sq = pk.params.sig_bound_sq;
+
+    // Validate the public key (length and coefficient range). This guards
+    // against panics from a directly-constructed PublicKey with mismatched
+    // dimensions; the encode/decode path also enforces this.
+    validate_public_key(pk)?;
 
     // Check signature length
     if sig.s2.len() != n {
@@ -97,6 +130,9 @@ pub fn verify_batch(
             reason: "messages and signatures must have same length",
         });
     }
+
+    // Validate the public key once for the whole batch.
+    validate_public_key(pk)?;
 
     for (message, sig) in messages.iter().zip(signatures.iter()) {
         verify(pk, message, sig)?;

@@ -19,6 +19,17 @@ use crate::params::{Params, Q, NONCE_SIZE};
 /// - Accepts if w < 5*q = 61445, rejects otherwise
 /// - Reduces w mod q to get the coefficient
 /// - All samples are processed identically regardless of acceptance
+///
+/// # FIPS 206 domain separation
+///
+/// The FIPS 206 draft prescribes a domain-separation prefix
+/// (algorithm-identifier byte plus an optional context string) on the
+/// SHAKE input. As of this release we deliberately match the PQClean
+/// Falcon-512/-1024 reference (which absorbs `salt || msg` only) so the
+/// 100 NIST round-3 KAT vectors continue to verify byte-for-byte. The
+/// FIPS 206 final standard's exact hash-input format is not yet locked;
+/// when it finalizes, this function should be updated and the signature
+/// wire format bumped to indicate the new domain.
 pub fn hash_to_point(message: &[u8], nonce: &[u8], params: &Params) -> Vec<Zq> {
     let n = params.n;
     let mut result = vec![Zq::ZERO; n];

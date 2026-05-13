@@ -1,0 +1,53 @@
+# cargo-deny configuration for the pq-cryto workspace.
+#
+# Run `cargo deny check` to enforce the rules below. Dependencies are
+# pinned to exact versions in each crate's Cargo.toml (see
+# `schemes/fn-dsa/Cargo.toml`); this file backs that pinning with
+# advisory, license, and source-origin gates.
+#
+# Format reference: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RUSTSEC database is the source of truth for CVEs in Rust crates.
+# `db-path` and `db-urls` use defaults.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Allowed licenses for transitive dependencies. The pq-cryto FN-DSA crate
+# is MIT-licensed; we accept permissive licenses commonly used in the
+# Rust ecosystem. Anything outside this list triggers a manual review.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Refuse multiple versions of the same crate. Prevents silent type-system
+# bifurcation (e.g., two versions of `rand_core` traits).
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Explicitly skip-listed: known cases where transitive deps pull in
+# multiple versions and the duplication is unavoidable. Keep this list
+# empty until cargo-deny actually fires.
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io is permitted as a registry. No git dependencies, no
+# private registries. Lock the supply chain to what `cargo audit` covers.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

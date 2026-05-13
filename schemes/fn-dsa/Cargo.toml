@@ -2,22 +2,29 @@
 name = "pqsigs-fn-dsa"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.76"
 description = "FN-DSA (FALCON) lattice-based post-quantum signature scheme"
 license = "MIT"
 repository = "https://github.com/kearneyjj1/pq-cryto"
 keywords = ["cryptography", "post-quantum", "signature", "falcon", "fn-dsa"]
 categories = ["cryptography"]
 
+# Dependency pinning policy: pinned to specific minor.patch versions so
+# `cargo update` cannot silently move us onto a new minor release that
+# (a) introduces a panic in a hot path, or (b) carries an advisory we
+# have not reviewed. Patch-level updates remain permitted via
+# `cargo update --package <name>`; bigger bumps require a deliberate edit
+# here.
 [dependencies]
-rand = "0.8"
-sha3 = "0.10"
-num-bigint = "0.4"
-num-traits = "0.2"
-zeroize = { version = "1.7", features = ["derive"] }
+rand = "=0.8.5"
+sha3 = "=0.10.8"
+num-bigint = "=0.4.6"
+num-traits = "=0.2.19"
+zeroize = { version = "=1.8.1", features = ["derive"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-hex = "0.4"
+criterion = { version = "=0.5.1", features = ["html_reports"] }
+hex = "=0.4.3"
 
 [[bench]]
 name = "fn_dsa_bench"

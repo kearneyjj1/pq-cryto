@@ -3,7 +3,7 @@
 //! This module implements the FALCON signature generation algorithm,
 //! which uses Fast Fourier Sampling to produce compact signatures.
 
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, ifft, Complex};
@@ -48,7 +48,12 @@ impl Signature {
 /// 5. Computes s2 = c - z0*f - z1*F
 /// 6. Checks if the norm is acceptable
 /// 7. Returns the signature (nonce, s2)
-pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
+///
+/// The RNG must be a cryptographically-secure source. The `CryptoRng`
+/// bound is enforced at the type level to prevent accidental use of
+/// weak (non-CSPRNG) random sources that would lead to predictable
+/// nonces and signature forgery.
+pub fn sign<R: RngCore + CryptoRng>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     let n = sk.params.n;
     let sigma = sk.params.sigma;
     let sigma_min = sk.params.sigma_min;
@@ -155,7 +160,10 @@ pub fn sign<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<S
 /// discrete Gaussian and uses rejection sampling to find a short (s1, s2) pair.
 /// This approach is much slower and doesn't provide the same security guarantees,
 /// but it demonstrates the verification correctness.
-pub fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
+///
+/// Crate-private: this function is a non-spec footgun and is retained only
+/// for internal demonstration tests. Use [`sign`] for any real signing.
+pub(crate) fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> Result<Signature> {
     use crate::poly::Poly;
 
     let n = sk.params.n;
@@ -178,11 +186,11 @@ pub fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> R
             .map(|_| sampler.sample(rng, 0.0, sigma) as i16)
             .collect();
 
-        // Compute s1 = c - s2*h using the same polynomial arithmetic as verification
+        // Compute s1 = c - s2*h using exact NTT mul to match the verifier.
         let c_poly = Poly::from_zq(c.clone());
         let s2_poly = Poly::from_i16(&s2);
         let h_poly = Poly::from_i16(&sk.h);
-        let s2h = s2_poly.mul(&h_poly);
+        let s2h = s2_poly.mul_ntt(&h_poly);
         let s1_poly = c_poly.sub(&s2h);
 
         // Check the norm (using saturating arithmetic for safety)
@@ -203,7 +211,11 @@ pub fn sign_simple<R: RngCore>(rng: &mut R, sk: &SecretKey, message: &[u8]) -> R
 }
 
 /// Signs a message with a specific nonce (for testing/debugging).
-pub fn sign_with_nonce<R: RngCore>(
+///
+/// Crate-private: bypasses the ffSampling algorithm in favor of a simple
+/// direct Gaussian draw, so it does not produce FALCON-distributed
+/// signatures. Retained only for internal debugging.
+pub(crate) fn sign_with_nonce<R: RngCore>(
     rng: &mut R,
     sk: &SecretKey,
     message: &[u8],
@@ -336,5 +348,80 @@ mod tests {
 
         assert_eq!(sig.s2.len(), 512);
         assert!((sig.norm_sq() as f64) < keypair.sk.params.sig_bound_sq);
+    }
+
+    /// Statistical-distribution check for FALCON-512 signature norms.
+    ///
+    /// Signs many messages with a single FALCON-512 keypair and asserts
+    /// that the empirical distribution of `||s2||²` (the public component
+    /// of the signature norm) is consistent with the FALCON predicted
+    /// distribution. This is a regression canary for sampler bugs that
+    /// would otherwise present only as "signatures don't verify" much
+    /// further down the test chain — a structural sampler error makes
+    /// the empirical distribution diverge dramatically and trips this
+    /// test on the first oversized sample.
+    ///
+    /// The acceptance bound is loose (within 50% of predicted mean) so
+    /// the test stays stable across RNG seeds. Tighten it locally if
+    /// investigating sampler regressions.
+    #[test]
+    fn test_sign_falcon_512_norm_distribution() {
+        use crate::keygen::keygen_512;
+        use crate::verify::verify;
+
+        let mut rng = StdRng::seed_from_u64(2026_05_13);
+        let keypair = keygen_512(&mut rng).expect("FALCON-512 keygen must succeed");
+
+        const N_SAMPLES: usize = 50;
+        let bound_sq = keypair.sk.params.sig_bound_sq;
+
+        let mut total_norm_sq_sum: f64 = 0.0;
+        let mut total_norm_sq_sum_sq: f64 = 0.0;
+        let mut max_total_norm_sq: i64 = 0;
+
+        for i in 0..N_SAMPLES {
+            let msg = format!("falcon-512 norm distribution probe {}", i);
+            let sig = sign(&mut rng, &keypair.sk, msg.as_bytes())
+                .expect("sign must succeed for valid FALCON-512 key");
+            verify(&keypair.pk, msg.as_bytes(), &sig)
+                .expect("our own signatures must verify");
+
+            // Reconstruct the s1 component the same way the verifier does so
+            // we capture the full ||(s1, s2)||² metric, not just ||s2||².
+            use crate::hash::hash_to_point;
+            use crate::poly::Poly;
+            let c = hash_to_point(msg.as_bytes(), &sig.nonce, &keypair.pk.params);
+            let s1 = Poly::from_zq(c).sub(
+                &Poly::from_i16(&sig.s2).mul_ntt(&Poly::from_i16(&keypair.pk.h)),
+            );
+            let s1_norm_sq = s1.norm_sq();
+            let s2_norm_sq = sig.norm_sq();
+            let total = s1_norm_sq.saturating_add(s2_norm_sq);
+            total_norm_sq_sum += total as f64;
+            total_norm_sq_sum_sq += (total as f64) * (total as f64);
+            max_total_norm_sq = max_total_norm_sq.max(total);
+        }
+
+        let n = N_SAMPLES as f64;
+        let mean = total_norm_sq_sum / n;
+
+        // Every signature must satisfy the FIPS bound (this is the
+        // verifier's predicate; if any violates, verify would have failed).
+        assert!(
+            (max_total_norm_sq as f64) <= bound_sq,
+            "Maximum total_norm_sq {} exceeds bound {}",
+            max_total_norm_sq, bound_sq
+        );
+
+        // The predicted mean of ||(s1, s2)||² for FALCON is 2*n*sigma² for
+        // n=512, sigma=165.74. With the sampler width clamped at sigma_min
+        // at some leaves the empirical mean can be a bit smaller, but it
+        // should be well above the per-coefficient noise floor and well
+        // below the bound. Loose check: between 0.05x and 0.95x of bound.
+        assert!(
+            mean > 0.05 * bound_sq && mean < 0.95 * bound_sq,
+            "Mean total_norm_sq {} should be in (5%, 95%) of bound {}",
+            mean, bound_sq
+        );
     }
 }

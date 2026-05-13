@@ -36,6 +36,8 @@
 //!
 //! Use only for learning, experimentation, and research.
 
+#![forbid(unsafe_code)]
+#![deny(noop_method_call)]
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 

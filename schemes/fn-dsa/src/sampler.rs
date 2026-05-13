@@ -34,6 +34,27 @@ pub struct FfSampler<'a> {
 
 impl<'a> FfSampler<'a> {
     /// Creates a new Fast Fourier Sampler borrowing the Gram-Schmidt data.
+    ///
+    /// `sigma_sign` is the global FALCON signing sigma (`Params::sigma`).
+    /// `sigma_min` is the per-leaf minimum sigma (`Params::sigma_min`); it
+    /// is used both by the underlying [`SamplerZ`] and as a floor on the
+    /// per-leaf effective sigma `sigma_sign / sqrt(d_i)`.
+    ///
+    /// # Spec note on the leaf-sigma floor
+    ///
+    /// FIPS 206 Algorithm 11 specifies `sigma' = sigma_sign / sqrt(d_i)`
+    /// without an explicit floor; instead the spec requires the key
+    /// generator to reject keys whose LDL\* diagonals would push any
+    /// leaf below `sigma_min`. Our keygen's `check_gram_schmidt_quality`
+    /// enforces this for production parameter sets (FALCON-512/1024).
+    ///
+    /// For toy parameter sets that intentionally skip the quality check
+    /// (e.g. FALCON-16, used in tests), we clamp at `sigma_min` so the
+    /// sampler still terminates instead of falling into a degenerate
+    /// rejection loop. **The clamped distribution is not FIPS-compliant**;
+    /// it is a robustness measure for non-spec parameter sets only. If
+    /// the clamp ever engages on a production parameter set, that is a
+    /// `keygen` quality-check bug, not a sampler bug.
     pub fn new(gs: &'a GramSchmidt, sigma_sign: f64, sigma_min: f64) -> Self {
         FfSampler {
             gs,
@@ -117,18 +138,44 @@ impl<'a> FfSampler<'a> {
             // both t0[0] and t1[0] should have negligible imaginary part
             // at the deepest recursion. A meaningful im here would signal
             // either a wrong FFT root ordering or an integer-rounding step
-            // that broke symmetry mid-recursion. Tolerance accounts for
-            // O(log n) levels of accumulated FP noise.
-            debug_assert!(
-                t0[0].im.abs() < 1e-6,
+            // that broke symmetry mid-recursion.
+            //
+            // The theoretical FP error bound for n=512 is on the order of
+            // log2(n) * eps_machine * max|t| ≈ 9 * 2.2e-16 * O(100) ≈ 2e-13.
+            // We assert with a 1e-9 tolerance: well above the theoretical
+            // bound but tight enough to catch any genuine symmetry break.
+            // Using `assert!` rather than `debug_assert!` so the check is
+            // active in release builds; the two scalar comparisons per
+            // signing call are negligible cost.
+            assert!(
+                t0[0].im.abs() < 1e-9,
                 "leaf t0 has non-real value im={}", t0[0].im
             );
-            debug_assert!(
-                t1[0].im.abs() < 1e-6,
+            assert!(
+                t1[0].im.abs() < 1e-9,
                 "leaf t1 has non-real value im={}", t1[0].im
             );
-            let sigma_0 = (self.sigma_sign / node.sigma[0]).max(self.sigma_min);
-            let sigma_1 = (self.sigma_sign / node.sigma[1]).max(self.sigma_min);
+            let raw_sigma_0 = self.sigma_sign / node.sigma[0];
+            let raw_sigma_1 = self.sigma_sign / node.sigma[1];
+            // Runtime canary: on FIPS-compliant parameter sets (n >= 256)
+            // keygen's basis-quality check ensures both raw sigmas already
+            // satisfy `>= sigma_min`, so the clamp below is a no-op. If
+            // this debug_assert ever fires on FALCON-512/1024 it indicates
+            // a keygen quality-check bug or a regression in the LDL* tree.
+            // Toy parameter sets (n < 256) deliberately skip the check and
+            // may engage the clamp; the assert is gated accordingly.
+            debug_assert!(
+                self.gs.tree.n < 256 || raw_sigma_0 >= self.sigma_min,
+                "leaf sigma_0 {} below sigma_min {} on production parameter set",
+                raw_sigma_0, self.sigma_min
+            );
+            debug_assert!(
+                self.gs.tree.n < 256 || raw_sigma_1 >= self.sigma_min,
+                "leaf sigma_1 {} below sigma_min {} on production parameter set",
+                raw_sigma_1, self.sigma_min
+            );
+            let sigma_0 = raw_sigma_0.max(self.sigma_min);
+            let sigma_1 = raw_sigma_1.max(self.sigma_min);
             let l10 = node.l10[0];
 
             // Sample z1 first (second basis vector direction)
@@ -376,6 +423,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // The debug-norms test uses `Poly::mul` for diagnostic comparison.
 mod ff_sampling_tests {
     use crate::keygen::keygen_16;
     use crate::sign::sign;

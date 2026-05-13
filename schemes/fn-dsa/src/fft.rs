@@ -37,6 +37,23 @@ compile_error!(
      Compile with RUSTFLAGS=\"-C target-feature=+sse2\" or target an x86_64 platform."
 );
 
+// MXCSR FTZ/DAZ — intentional non-implementation.
+//
+// On older x86 CPUs (pre-Skylake) the FPU pays a ~100x penalty when a
+// multiplication produces a subnormal result, which can leak via timing
+// whether the FFT path crossed denormal territory on a secret-derived
+// value. The remediation is to set the MXCSR flush-to-zero /
+// denormals-are-zero bits at crate init, e.g. via
+// `core::arch::x86_64::_MM_SET_FLUSH_ZERO_MODE`. That intrinsic is
+// `unsafe`, and this crate has `#![forbid(unsafe_code)]` at the root
+// — `forbid` cannot be locally overridden. We chose memory-safety-by-
+// construction over the subnormal mitigation; the trade-off favors
+// modern CPUs (Ice Lake and later have data-independent subnormal
+// performance). If a deployment requires the MXCSR fix, the route is:
+// (1) downgrade the lint to `#![deny(unsafe_code)]`, (2) add
+// `#[allow(unsafe_code)]` on a single dedicated init function, (3)
+// document the lift in SECURITY.md.
+
 /// Verifies that the floating-point environment uses IEEE 754 round-to-nearest-even,
 /// which is required for FALCON's FFT arithmetic to produce consistent results.
 fn assert_fp_rounding_mode() {

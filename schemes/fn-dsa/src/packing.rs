@@ -242,6 +242,16 @@ pub fn decode_secret_key(bytes: &[u8]) -> Result<SecretKey> {
         big_g.push(coeff);
     }
 
+    // Validate the NTRU equation `f*G - g*F = q`. Without this check a
+    // crafted blob with arbitrary (F, G) decodes into a SecretKey that
+    // signs garbage and can leak the legitimate (F, G) via rejection-
+    // loop timing.
+    if !crate::ntru::verify_ntru_equation_i16(&f, &g, &big_f, &big_g, n) {
+        return Err(FnDsaError::InvalidKey {
+            reason: "secret key fails NTRU equation f*G - g*F = q",
+        });
+    }
+
     // Recompute Gram-Schmidt data
     let gs = compute_gram_schmidt(&f, &g, &big_f, &big_g);
 

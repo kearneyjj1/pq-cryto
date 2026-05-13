@@ -3,7 +3,7 @@
 //! This module implements the FALCON key generation algorithm,
 //! which produces a public/secret key pair from random input.
 
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 use crate::error::{FnDsaError, Result};
 use crate::fft::{fft, Complex};
 use crate::fft_tree::GramSchmidt;
@@ -33,29 +33,31 @@ impl PublicKey {
 ///
 /// # Security
 ///
+/// The secret-material fields (`f`, `g`, `F`, `G`, `h`, `gs`) are
+/// crate-private to prevent accidental external readout. Use the
+/// [`crate::packing::encode_secret_key`] entry point to serialize.
+///
 /// This struct implements `Drop` to zeroize secret key material when dropped.
 ///
-/// **Cloning warning**: When a `SecretKey` is cloned, the clone contains an
-/// independent copy of all secret material (polynomials `f`, `g`, `F`, `G`
-/// and the Gram-Schmidt / LDL* tree). Both the original and the clone must
-/// be dropped for complete zeroization of secret data from memory. Avoid
-/// cloning unless necessary (e.g., for a separate signing context).
-#[derive(Clone)]
+/// `Clone` is not derived: duplicating a secret key doubles the in-memory
+/// secret footprint and requires per-copy zeroization. Use
+/// [`SecretKey::try_clone`] if duplication is genuinely needed; the explicit
+/// fallible API makes the intent visible at the call site.
 pub struct SecretKey {
     /// The polynomial f (small coefficients).
-    pub f: Vec<i8>,
+    pub(crate) f: Vec<i8>,
     /// The polynomial g (small coefficients).
-    pub g: Vec<i8>,
+    pub(crate) g: Vec<i8>,
     /// The polynomial F (NTRU complement of f).
     /// Uses i16 since coefficients may exceed i8 range after Babai reduction.
-    pub big_f: Vec<i16>,
+    pub(crate) big_f: Vec<i16>,
     /// The polynomial G (NTRU complement of g).
     /// Uses i16 since coefficients may exceed i8 range after Babai reduction.
-    pub big_g: Vec<i16>,
-    /// The public key h = g/f mod q (for signature computation).
-    pub h: Vec<i16>,
+    pub(crate) big_g: Vec<i16>,
+    /// The public key h = g/f mod q (cached for signature computation).
+    pub(crate) h: Vec<i16>,
     /// The Gram-Schmidt orthogonalized basis for sampling.
-    pub gs: GramSchmidt,
+    pub(crate) gs: GramSchmidt,
     /// The parameter set.
     pub params: Params,
 }
@@ -80,15 +82,55 @@ impl SecretKey {
     pub fn encoded_size(&self) -> usize {
         self.params.sk_bytes
     }
+
+    /// Explicitly duplicates the secret key.
+    ///
+    /// `SecretKey` does not implement `Clone` because duplication doubles
+    /// the in-memory footprint of secret material and requires per-copy
+    /// zeroization. Callers that genuinely need a second copy (for example,
+    /// to run signing on a different thread) should invoke `try_clone`
+    /// explicitly and ensure both copies are dropped to scrub all memory.
+    pub fn try_clone(&self) -> Self {
+        // Rebuild the Gram-Schmidt from the basis polynomials rather than
+        // calling `GramSchmidt::clone` (which is no longer derived). This
+        // is more expensive than a flat clone but it keeps the secret-
+        // material lifecycle visible: every recompute goes through the
+        // same `GramSchmidt::new` invariant.
+        let f_fft: Vec<Complex> = self.f.iter().map(|&x| Complex::from_real(x as f64)).collect();
+        let g_fft: Vec<Complex> = self.g.iter().map(|&x| Complex::from_real(x as f64)).collect();
+        let big_f_fft: Vec<Complex> = self.big_f.iter().map(|&x| Complex::from_real(x as f64)).collect();
+        let big_g_fft: Vec<Complex> = self.big_g.iter().map(|&x| Complex::from_real(x as f64)).collect();
+        let mut f_fft_m = f_fft;
+        let mut g_fft_m = g_fft;
+        let mut big_f_fft_m = big_f_fft;
+        let mut big_g_fft_m = big_g_fft;
+        fft(&mut f_fft_m);
+        fft(&mut g_fft_m);
+        fft(&mut big_f_fft_m);
+        fft(&mut big_g_fft_m);
+        let gs = GramSchmidt::new(f_fft_m, g_fft_m, big_f_fft_m, big_g_fft_m);
+
+        SecretKey {
+            f: self.f.clone(),
+            g: self.g.clone(),
+            big_f: self.big_f.clone(),
+            big_g: self.big_g.clone(),
+            h: self.h.clone(),
+            gs,
+            params: self.params,
+        }
+    }
 }
 
 /// A FALCON key pair.
 ///
 /// # Security
 ///
-/// Cloning a `KeyPair` clones the embedded [`SecretKey`]. See the security
-/// notes on `SecretKey` regarding independent zeroization of cloned copies.
-#[derive(Clone)]
+/// `KeyPair` does not implement `Clone` because the embedded
+/// [`SecretKey`] does not (cloning a secret key doubles its memory
+/// footprint and requires per-copy zeroization). Use
+/// [`SecretKey::try_clone`] and clone the public key separately if
+/// duplication is genuinely needed.
 pub struct KeyPair {
     /// The public key.
     pub pk: PublicKey,
@@ -97,15 +139,25 @@ pub struct KeyPair {
 }
 
 /// Computes the keygen sigma for polynomial sampling per FIPS 206.
+/// Fixed keygen sigma used for toy parameter sets (n < 256).
+///
+/// The FIPS 206 formula `1.17 * sqrt(q / (2n))` produces unreasonably
+/// large sigmas when n is small (e.g. ~6.9 for n=16), which dominates
+/// the resulting basis and produces unusable test keys. We instead use
+/// a fixed moderate value chosen empirically to keep the NTRU basis
+/// in a workable range at n=16 and n=64. This constant has no
+/// security meaning; toy parameter sets are `#[cfg(test)]`-only.
+const TOY_KEYGEN_SIGMA: f64 = 1.5;
+
 ///
 /// sigma_keygen = 1.17 * sqrt(q / (2*n))
 /// - n=512:  ~4.05
 /// - n=1024: ~2.87
-/// For small test parameters (n < 256), uses a fixed moderate value since
+/// For small test parameters (n < 256), uses [`TOY_KEYGEN_SIGMA`] since
 /// the FIPS 206 formula produces unreasonably large sigmas.
 fn keygen_sigma(n: usize) -> f64 {
     if n < 256 {
-        return 1.5; // Moderate value for toy test parameters
+        return TOY_KEYGEN_SIGMA;
     }
     1.17 * ((Q as f64) / (2.0 * n as f64)).sqrt()
 }
@@ -136,6 +188,16 @@ fn max_fg_norm_sq(n: usize) -> i64 {
 /// base sampler at sigma_0=1.82 has lighter tails than the keygen sigma≈4.05,
 /// causing incorrect variance. SamplerZ is designed for the signing path where
 /// sigma ≈ sigma_min ≈ 1.28 < sigma_0.
+///
+/// # Side-channel note
+///
+/// The underlying `sample_z_gaussian` is a variable-time rejection loop.
+/// This leaks information about the sampled value via timing during key
+/// generation. The leak is keygen-time only (the signer's per-leaf sampler
+/// has its own, separate side-channel posture); a co-located attacker who
+/// can time keygen can learn statistical information about `f, g`. The
+/// proper fix is a constant-time CDT-based half-Gaussian sampler tuned to
+/// the keygen sigma.
 fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8> {
     let mut poly = vec![0i8; n];
 
@@ -153,21 +215,27 @@ fn generate_small_poly<R: RngCore>(rng: &mut R, n: usize, sigma: f64) -> Vec<i8>
 /// A polynomial f is invertible in Z_q[X]/(X^n + 1) if and only if
 /// its NTT (Number Theoretic Transform) has no zero components.
 /// This uses exact modular arithmetic rather than floating-point FFT.
+///
+/// # Side-channel resistance
+///
+/// Constant-time: the loop scans all `n` NTT coefficients regardless of
+/// which (if any) is zero, accumulating into a single boolean via
+/// branchless OR. An earlier implementation returned on the first zero,
+/// leaking via timing the index of the first zero coefficient.
 fn is_invertible(f: &[i8], n: usize) -> bool {
-    // Convert to Zq
     let f_zq: Vec<Zq> = f.iter().map(|&x| Zq::new(x as i32)).collect();
-
-    // Compute exact NTT
     let f_ntt = ntt(&f_zq, n);
 
-    // Check that no NTT coefficient is zero
+    // Accumulate "any zero" as the bitwise OR of `is_zero` masks across all
+    // coefficients. Each iteration touches every element; the boolean
+    // accumulator is updated unconditionally. Cost: O(n) regardless of
+    // input, vs. the previous early-exit pattern that could leak.
+    let mut any_zero: u8 = 0;
     for c in &f_ntt {
-        if c.is_zero() {
-            return false;
-        }
+        // `c.is_zero()` returns a bool; cast to u8 (0 or 1) and OR in.
+        any_zero |= c.is_zero() as u8;
     }
-
-    true
+    any_zero == 0
 }
 
 /// Checks if the LDL* tree has acceptable quality for FALCON signing.
@@ -222,7 +290,11 @@ fn compute_public_key(f: &[i8], g: &[i8]) -> Result<Vec<i16>> {
 /// `||f||^2 + ||g||^2`, solves the NTRU equation `fG - gF = q`, computes
 /// the Gram-Schmidt / LDL* tree, and verifies tree quality at all leaves.
 /// Uses a single Gaussian sampling strategy as specified by the standard.
-pub fn keygen<R: RngCore>(rng: &mut R, params: &Params) -> Result<KeyPair> {
+///
+/// The RNG must be a cryptographically-secure source; the `CryptoRng`
+/// bound prevents accidental use of weak PRNGs (e.g. `XorShiftRng`,
+/// `Pcg`) that would compromise key unpredictability.
+pub fn keygen<R: RngCore + CryptoRng>(rng: &mut R, params: &Params) -> Result<KeyPair> {
     let n = params.n;
     let sigma = keygen_sigma(n);
     let norm_bound = max_fg_norm_sq(n);
@@ -300,18 +372,18 @@ pub fn keygen_with_seed(seed: u64, params: &Params) -> Result<KeyPair> {
 }
 
 /// Generates a FALCON-512 key pair.
-pub fn keygen_512<R: RngCore>(rng: &mut R) -> Result<KeyPair> {
+pub fn keygen_512<R: RngCore + CryptoRng>(rng: &mut R) -> Result<KeyPair> {
     keygen(rng, &FALCON_512)
 }
 
 /// Generates a FALCON-1024 key pair.
-pub fn keygen_1024<R: RngCore>(rng: &mut R) -> Result<KeyPair> {
+pub fn keygen_1024<R: RngCore + CryptoRng>(rng: &mut R) -> Result<KeyPair> {
     keygen(rng, &FALCON_1024)
 }
 
 /// Generates a FALCON-16 key pair (for testing only).
 #[cfg(test)]
-pub fn keygen_16<R: RngCore>(rng: &mut R) -> Result<KeyPair> {
+pub fn keygen_16<R: RngCore + CryptoRng>(rng: &mut R) -> Result<KeyPair> {
     use crate::params::FALCON_16;
     keygen(rng, &FALCON_16)
 }
@@ -331,7 +403,7 @@ mod tests {
 
         assert_eq!(poly.len(), n);
 
-        // keygen_sigma(64) = 1.5 (capped for small n)
+        // keygen_sigma(64) = TOY_KEYGEN_SIGMA (capped for small n)
         // Coefficients should be within ~5*sigma ≈ 7.5
         for &c in &poly {
             assert!(c.abs() <= 10, "Coefficient {} is too large for sigma={:.1}", c, sigma);

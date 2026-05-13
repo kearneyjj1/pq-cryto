@@ -143,10 +143,21 @@ impl Poly {
         }
     }
 
-    /// Multiplies two polynomials in Z_q[X]/(X^n + 1) using FFT.
+    /// Multiplies two polynomials in Z_q[X]/(X^n + 1) using floating-point FFT.
     ///
-    /// Uses floating-point FFT — fast but subject to rounding error.
-    /// For exact arithmetic, use [`mul_ntt`](Self::mul_ntt) instead.
+    /// **Deprecated for any signing or norm-comparison path.** The
+    /// floating-point FFT introduces per-coefficient rounding on the order
+    /// of one ULP scaled by the product magnitude. For typical signing
+    /// inputs (n=512, coefficients in `[-q/2, q/2]`) the accumulated error
+    /// is large enough to make a signer-side norm check disagree with the
+    /// verifier (which uses [`mul_ntt`]).
+    ///
+    /// Retained only for educational / experimental code paths
+    /// (notably `sign::sign_simple`, a deliberate non-FALCON demonstrator).
+    /// All correctness-critical multiplications should use [`mul_ntt`].
+    #[deprecated(
+        note = "use Poly::mul_ntt for any signing or norm-comparison path; FP-FFT rounding can flip rejection-loop outcomes"
+    )]
     pub fn mul(&self, other: &Poly) -> Poly {
         debug_assert_eq!(self.len(), other.len());
 
@@ -175,12 +186,27 @@ impl Poly {
         // Convert back
         ifft(&mut c_fft);
 
-        // Round and reduce with overflow protection
+        // Round and reduce with overflow protection.
+        //
+        // The clamp to `[i32::MIN, i32::MAX]` is a safety net for catastrophic
+        // FP failure (e.g. NaN propagation from a buggy FFT). In normal operation,
+        // valid Z_q × Z_q products fit comfortably in i32 (max magnitude
+        // ~ n * q² ≈ 7.7e10, much less than i32::MAX ≈ 2.1e9... wait,
+        // n=1024 * q² actually exceeds i32; but the FFT outputs in
+        // [-q/2, q/2] post-reduction so per-coefficient values are bounded
+        // by ~n * q which is fine). A magnitude above 1e15 indicates a
+        // genuine FP disaster (precision loss or NaN). The debug_assert
+        // surfaces this in development builds.
         Poly {
             coeffs: c_fft
                 .iter()
                 .map(|c| {
                     let rounded = c.re.round();
+                    debug_assert!(
+                        rounded.is_finite() && rounded.abs() < 1e15,
+                        "Poly::mul produced out-of-range coefficient: {}",
+                        rounded
+                    );
                     // Clamp to i32 range to prevent overflow on cast
                     let clamped = rounded.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
                     Zq::new(clamped)
@@ -473,6 +499,7 @@ pub fn poly_mul_schoolbook(a: &[Zq], b: &[Zq]) -> Vec<Zq> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Tests intentionally exercise the FP-FFT `Poly::mul` path.
 mod tests {
     use super::*;
 

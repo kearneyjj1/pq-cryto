@@ -15,13 +15,17 @@ use crate::fft::{split_fft, Complex};
 use zeroize::Zeroize;
 
 /// A node in the FFT tree storing LDL* decomposition data.
-#[derive(Clone, Debug)]
+///
+/// Fields are crate-private: this is secret-derived material and should
+/// only be touched by code in this crate. External consumers must not
+/// be able to read or reconstruct the underlying basis from these values.
+#[derive(Debug)]
 pub struct FftNode {
     /// The sigma values: sqrt of the LDL* diagonal at this level.
-    pub sigma: Vec<f64>,
+    pub(crate) sigma: Vec<f64>,
     /// The l10 values: off-diagonal factor from LDL* decomposition.
     /// At the base case (n=1), l10 has one element.
-    pub l10: Vec<Complex>,
+    pub(crate) l10: Vec<Complex>,
 }
 
 impl Drop for FftNode {
@@ -49,13 +53,15 @@ impl FftNode {
 /// The FFT tree structure for FALCON's sampler.
 ///
 /// The tree stores the Gram-Schmidt orthogonalization of the secret key
-/// in a form suitable for the recursive FFT sampling algorithm.
-#[derive(Clone, Debug)]
+/// in a form suitable for the recursive FFT sampling algorithm. Fields
+/// (and the tree itself) embed secret material; `Clone` is intentionally
+/// not derived to prevent silent duplication.
+#[derive(Debug)]
 pub struct FftTree {
     /// The polynomial degree n.
-    pub n: usize,
+    pub(crate) n: usize,
     /// Tree depth (log2(n) + 1).
-    pub depth: usize,
+    pub(crate) depth: usize,
     /// Tree nodes, organized by level.
     /// Level 0 has 1 node (root), level k has 2^k nodes.
     nodes: Vec<FftNode>,
@@ -73,9 +79,11 @@ impl FftTree {
         assert!(n.is_power_of_two(), "n must be a power of 2");
         let depth = n.trailing_zeros() as usize + 1;
 
-        // Total nodes: 1 + 2 + 4 + ... + n = 2n - 1
+        // Total nodes: 1 + 2 + 4 + ... + n = 2n - 1. We construct via
+        // `map(|_| empty())` rather than `vec![empty(); total_nodes]`
+        // because `FftNode` deliberately does not implement `Clone`.
         let total_nodes = 2 * n - 1;
-        let nodes = vec![FftNode::empty(); total_nodes];
+        let nodes: Vec<FftNode> = (0..total_nodes).map(|_| FftNode::empty()).collect();
 
         FftTree { n, depth, nodes }
     }
@@ -194,11 +202,13 @@ impl FftTree {
         for i in 0..n {
             d0[i] = g00[i];
             l10[i] = g01[i].conj().scale(1.0 / g00[i]);
-            d1[i] = g11[i] - g01[i].norm_sq() / g00[i];
-            // Clamp d1 to avoid negative values from floating-point error
-            if d1[i] < 0.0 {
-                d1[i] = 0.0;
-            }
+            // Clamp d1 to avoid negative values from floating-point error.
+            // `f64::max` compiles to `maxsd` on x86_64 with SSE2, which is
+            // data-independent in timing. Avoids the branch `if d1 < 0` on
+            // a secret-derived value that the prior code exposed; the
+            // 2026-02-15 side-channel audit's HIGH-004 (FFT tree d1 branch)
+            // is resolved by this rewrite.
+            d1[i] = (g11[i] - g01[i].norm_sq() / g00[i]).max(0.0);
         }
 
         // Store sigma = sqrt(d0) and l10 at this node
@@ -237,20 +247,30 @@ impl FftTree {
 /// Stores the Gram-Schmidt orthogonalization of the NTRU secret basis
 /// `B = [[g, -f], [G, -F]]` (row-vector convention, `fG - gF = q`)
 /// in a form suitable for FFT-domain sampling.
-#[derive(Clone, Debug)]
+///
+/// All fields are crate-private. Reading them would let any consumer
+/// recover the underlying secret basis (`f, g, F, G`) via an inverse
+/// FFT. `Clone` is intentionally not derived so duplication of secret
+/// material requires explicit intent at the call site.
+#[derive(Debug)]
 pub struct GramSchmidt {
     /// The [[g, -f], [G, -F]] basis polynomials in FFT form.
-    pub f_fft: Vec<Complex>,
-    pub g_fft: Vec<Complex>,
-    pub big_f_fft: Vec<Complex>,
-    pub big_g_fft: Vec<Complex>,
+    pub(crate) f_fft: Vec<Complex>,
+    /// (See `f_fft`).
+    pub(crate) g_fft: Vec<Complex>,
+    /// (See `f_fft`).
+    pub(crate) big_f_fft: Vec<Complex>,
+    /// (See `f_fft`).
+    pub(crate) big_g_fft: Vec<Complex>,
 
     /// The FFT tree for sampling.
-    pub tree: FftTree,
+    pub(crate) tree: FftTree,
 
-    /// Precomputed sigma values for the full basis.
-    pub sigma_fg: Vec<f64>,
-    pub sigma_FG: Vec<f64>,
+    /// Precomputed sigma values for the (f, g) half of the basis.
+    pub(crate) sigma_fg: Vec<f64>,
+    /// Precomputed sigma values for the (F, G) half of the basis.
+    #[allow(non_snake_case)]
+    pub(crate) sigma_FG: Vec<f64>,
 }
 
 impl GramSchmidt {

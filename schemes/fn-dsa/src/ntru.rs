@@ -743,7 +743,7 @@ fn babai_reduce_coefficients(
 /// For n <= 32, uses exact O(n^2) schoolbook arithmetic.
 /// For larger n, uses NTT mod q (O(n log n)) as a necessary condition check,
 /// plus an exact O(n) constant-term computation to confirm the result is q.
-fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
+pub(crate) fn verify_ntru_equation_i16(f: &[i8], g: &[i8], big_f: &[i16], big_g: &[i16], n: usize) -> bool {
     if n <= 32 {
         return verify_ntru_equation_i16_schoolbook(f, g, big_f, big_g, n);
     }

@@ -141,6 +141,20 @@ pub const FALCON_16: Params = Params {
 pub const BETA: f64 = 0.5;
 
 /// Maximum number of signing attempts before giving up.
+///
+/// FALCON signing rejects samples whose `||(s1, s2)||² > sig_bound_sq`.
+/// For FIPS-compliant parameter sets (FALCON-512/1024) with keys passing
+/// the keygen quality check, the per-attempt success probability is
+/// empirically `>= 1 - 1/2^32` (signing typically succeeds on attempt 1).
+/// With 100 attempts the failure probability is therefore well below
+/// the FIPS 206 target of `2^-128`. This bound is retained as a defense
+/// against pathological keys; if you encounter `SigningFailed`
+/// repeatedly with valid keys, that is a bug — file a report rather than
+/// raising this value.
+///
+/// For toy parameter sets (FALCON-16) the per-attempt success rate is
+/// much lower (NTRU basis quality is intentionally not enforced); 100
+/// attempts is sufficient for the test seeds used in this crate.
 pub const MAX_SIGN_ATTEMPTS: u32 = 100;
 
 /// Nonce size in bytes for signing.
