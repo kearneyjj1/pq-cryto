@@ -586,7 +586,19 @@ pub fn decode_signature(bytes: &[u8]) -> Result<(Signature, usize)> {
 ///
 /// Shared decoder used by both FIPS 206 and compressed signature formats.
 /// Reads `n` coefficients from `data` using Golomb-Rice coding with parameter `k`.
-fn decode_golomb_rice(data: &[u8], n: usize, k: usize) -> Result<Vec<i16>> {
+///
+/// Enforces canonical encoding per Falcon spec §3.11.2: after the `n`-th coefficient,
+/// any unread pad bits in the partially-consumed byte must be zero. When
+/// `allow_zero_padding` is `false`, all bytes in `data` must be consumed; when `true`,
+/// any unread trailing bytes are permitted but must themselves be zero (used for the
+/// fixed-length NIST "padded" signature format). This closes the strict-EUF-CMA
+/// malleability gap described in audit finding CRIT-01 (2026-05-16).
+fn decode_golomb_rice(
+    data: &[u8],
+    n: usize,
+    k: usize,
+    allow_zero_padding: bool,
+) -> Result<Vec<i16>> {
     let k_mask = (1u64 << k) - 1;
     let max_coeff = (crate::params::Q / 2) as i16;
 
@@ -677,6 +689,50 @@ fn decode_golomb_rice(data: &[u8], n: usize, k: usize) -> Result<Vec<i16>> {
         s2.push(coeff);
     }
 
+    // Canonical-encoding enforcement (CRIT-01 fix).
+    //
+    // The Golomb-Rice bit stream is LSB-first: the refill loop loads bytes
+    // into the high positions of `bit_buffer`, and reads consume from the
+    // low end via `bit_buffer & 1; bit_buffer >>= 1`. After the n-th
+    // coefficient is decoded, `bit_buffer` holds `bit_count` unread bits
+    // at positions `0..bit_count`. Per Falcon spec §3.11.2 these are pad
+    // bits and MUST all be zero; the encoder always emits them as zero
+    // (lines 359-368 / 482-493), so a non-zero residual is evidence of
+    // post-encoding mutation.
+    if bit_count > 0 {
+        let pad_mask: u64 = if bit_count >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_count) - 1
+        };
+        if (bit_buffer & pad_mask) != 0 {
+            return Err(FnDsaError::InvalidInput {
+                field: "signature",
+                reason: "non-canonical encoding: non-zero pad bits in final byte",
+            });
+        }
+    }
+
+    if allow_zero_padding {
+        // NIST-padded format: the slice extends to a fixed length with
+        // zero-byte padding. Tolerate trailing bytes but require them
+        // to be zero (otherwise the signature is malleable).
+        for &b in &data[byte_idx..] {
+            if b != 0 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "signature",
+                    reason: "non-zero byte in NIST signature padding region",
+                });
+            }
+        }
+    } else if byte_idx < data.len() {
+        // Non-padded format (FIPS 206 / FSC1): any extra bytes are forbidden.
+        return Err(FnDsaError::InvalidInput {
+            field: "signature",
+            reason: "non-canonical encoding: excess trailing bytes",
+        });
+    }
+
     Ok(s2)
 }
 
@@ -694,7 +750,8 @@ fn decode_signature_fips206(bytes: &[u8], n: usize) -> Result<(Signature, usize)
     nonce.copy_from_slice(&bytes[1..1 + NONCE_SIZE]);
 
     let k = rice_k_for_n(n);
-    let s2 = decode_golomb_rice(&bytes[header_len..], n, k)?;
+    // FIPS 206 wire format is non-padded: reject any trailing bytes (CRIT-01).
+    let s2 = decode_golomb_rice(&bytes[header_len..], n, k, false)?;
 
     Ok((Signature { nonce, s2 }, n))
 }
@@ -713,7 +770,8 @@ fn decode_signature_compressed(bytes: &[u8], n: usize) -> Result<(Signature, usi
     nonce.copy_from_slice(&bytes[6..6 + NONCE_SIZE]);
 
     let k = rice_k_for_n(n);
-    let s2 = decode_golomb_rice(&bytes[header_len..], n, k)?;
+    // Legacy FSC1 compressed format is non-padded: reject any trailing bytes (CRIT-01).
+    let s2 = decode_golomb_rice(&bytes[header_len..], n, k, false)?;
 
     Ok((Signature { nonce, s2 }, n))
 }
@@ -892,8 +950,21 @@ pub fn parse_nist_signed_message(sm: &[u8], mlen: usize) -> Result<(Vec<u8>, Sig
         });
     }
 
-    // Parse header byte: 0x20 + logn for non-padded, 0x30 + logn for padded
+    // Parse header byte: 0x20 + logn for non-padded, 0x30 + logn for padded.
+    // Reject any other high nibble; otherwise a malformed header silently
+    // routes a padded slice through the strict (non-padded) decode path.
     let header = sig_data[0];
+    let format_nibble = header & 0xF0;
+    let allow_zero_padding = match format_nibble {
+        0x20 => false,
+        0x30 => true,
+        _ => {
+            return Err(FnDsaError::InvalidInput {
+                field: "nist_sm",
+                reason: "unsupported NIST signature header (expected 0x2X or 0x3X)",
+            });
+        }
+    };
     let log_n = (header & 0x0F) as usize;
     let n = 1usize << log_n;
 
@@ -905,9 +976,11 @@ pub fn parse_nist_signed_message(sm: &[u8], mlen: usize) -> Result<(Vec<u8>, Sig
     }
 
     // Decode compressed s2 using the original Falcon compression format
-    // (NOT FIPS 206 Golomb-Rice — the original uses sign+7bit+unary, MSB-first)
+    // (NOT FIPS 206 Golomb-Rice — the original uses sign+7bit+unary, MSB-first).
+    // The padded variant (header 0x3X) tolerates trailing zero pad bytes;
+    // the non-padded variant (0x2X) requires exact-fit consumption (CRIT-01).
     let compressed = &sig_data[1..]; // skip header byte
-    let s2 = decode_falcon_comp(compressed, n)?;
+    let s2 = decode_falcon_comp(compressed, n, allow_zero_padding)?;
 
     Ok((message, Signature { nonce, s2 }))
 }
@@ -921,7 +994,15 @@ pub fn parse_nist_signed_message(sm: &[u8], mlen: usize) -> Result<(Vec<u8>, Sig
 ///
 /// The bit stream is read MSB-first (big-endian bit ordering), unlike the FIPS 206
 /// Golomb-Rice format which uses LSB-first.
-fn decode_falcon_comp(data: &[u8], n: usize) -> Result<Vec<i16>> {
+///
+/// Enforces canonical encoding per Falcon spec §3.11.2: any unread bits in the
+/// accumulator at the end of decoding must be zero (pad bits), and trailing-byte
+/// handling depends on `allow_zero_padding`:
+/// - `false`: `data` must be fully consumed (FSC1-style strict, no trailing bytes).
+/// - `true`:  Unread trailing bytes must all be zero (NIST-padded format,
+///            header byte `0x30 + logn`).
+/// Closes the strict-EUF-CMA malleability described in audit finding CRIT-01 (2026-05-16).
+fn decode_falcon_comp(data: &[u8], n: usize, allow_zero_padding: bool) -> Result<Vec<i16>> {
     let mut s2 = Vec::with_capacity(n);
     let mut acc: u32 = 0;
     let mut acc_len: usize = 0;
@@ -978,6 +1059,47 @@ fn decode_falcon_comp(data: &[u8], n: usize) -> Result<Vec<i16>> {
 
         let coeff = if sign != 0 { -(m as i16) } else { m as i16 };
         s2.push(coeff);
+    }
+
+    // Canonical-encoding enforcement (CRIT-01 fix).
+    //
+    // Falcon-comp is MSB-first: `acc` holds unread bits at the LOW positions
+    // 0..acc_len. The encoder terminates each coefficient with a 1-bit unary
+    // marker followed by zero pad bits to the next byte boundary; the spec
+    // (Falcon round-3 §3.11.2 "comp_decode") and the C reference
+    // (PQClean `falcon-*/clean/codec.c`) require the decoder to reject any
+    // signature with a non-zero pad bit, otherwise verify becomes a many-to-one
+    // map and strict-EUF-CMA is broken.
+    if acc_len > 0 {
+        let pad_mask: u32 = if acc_len >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << acc_len) - 1
+        };
+        if (acc & pad_mask) != 0 {
+            return Err(FnDsaError::InvalidInput {
+                field: "falcon_comp",
+                reason: "non-canonical encoding: non-zero pad bits in final byte",
+            });
+        }
+    }
+
+    if allow_zero_padding {
+        // NIST-padded format: tolerate trailing bytes but require them to be zero.
+        for &b in &data[byte_idx..] {
+            if b != 0 {
+                return Err(FnDsaError::InvalidInput {
+                    field: "falcon_comp",
+                    reason: "non-zero byte in NIST signature padding region",
+                });
+            }
+        }
+    } else if byte_idx < data.len() {
+        // Non-padded (FSC1-style): any extra bytes are forbidden.
+        return Err(FnDsaError::InvalidInput {
+            field: "falcon_comp",
+            reason: "non-canonical encoding: excess trailing bytes",
+        });
     }
 
     Ok(s2)
